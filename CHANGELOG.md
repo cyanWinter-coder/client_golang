@@ -1,6 +1,7 @@
 ## Unreleased
 
 * [CHANGE] Change required go.mod version to 1.26 #2138
+* [FEATURE] prometheus: Add deadline-bound, context-aware collection via `Registry.GatherWithTimeout` and `Registry.GatherTransactionalWithContext`, together with the optional `ContextCollector` and `TransactionalCollector` interfaces. All collectors share one cancellation signal, a single slow collector can no longer delay the whole scrape, collector errors retain their source identity without dropping successful metrics, and transactional completion callbacks run exactly once. The existing `Gather` method is unchanged.
 * [FEATURE] testutil: Add GatherAndFormat to encode a subset of metrics from a Gatherer. #2091
 * [BUGFIX] **breaking** api/prometheus/v1: Fix `TSDBBlocks` so it can decode real server responses; fixes issues with data enveloping and aligns the TSDB Blocks struct types to match the upstream Prometheus counterpart. #1928
 * [BUGFIX] prometheus: `DeletePartialMatch` on a curried vector now deletes only metrics that carry the curried label values. Before, it could also delete matching metrics with other values for the curried labels. #2202
