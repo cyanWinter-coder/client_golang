@@ -20,7 +20,6 @@ import (
 	"maps"
 	"os"
 	"path/filepath"
-	"runtime"
 	"slices"
 	"sort"
 	"strconv"
@@ -77,6 +76,7 @@ func NewRegistry() *Registry {
 		collectorsByID:      map[uint64]Collector{},
 		expiredCleanersByID: map[uint64]ExpiredCleaner{},
 		descIDs:             map[uint64]struct{}{},
+		descsByID:           map[uint64][]*Desc{},
 		dimHashesByName:     map[string]uint64{},
 	}
 }
@@ -292,6 +292,7 @@ type Registry struct {
 	expiredCleanersByID   map[uint64]ExpiredCleaner // ID is a hash of the descIDs.
 	expiredCleaners       []ExpiredCleaner          // Immutable snapshot of expiredCleanersByID and uncheckedCollectors.
 	descIDs               map[uint64]struct{}
+	descsByID             map[uint64][]*Desc // Descriptors reported by each checked Collector, keyed by its collector ID.
 	dimHashesByName       map[string]uint64
 	uncheckedCollectors   []Collector
 	pedanticChecksEnabled bool
@@ -306,6 +307,7 @@ func (r *Registry) Register(c Collector) error {
 	var (
 		descChan           = make(chan *Desc, capDescChan)
 		newDescIDs         = map[uint64]struct{}{}
+		newDescs           []*Desc
 		newDimHashesByName = map[string]uint64{}
 		collectorID        uint64 // All desc IDs XOR'd together.
 		duplicateDescErr   error
@@ -341,6 +343,7 @@ func (r *Registry) Register(c Collector) error {
 		if _, exists := newDescIDs[desc.id]; !exists {
 			newDescIDs[desc.id] = struct{}{}
 			collectorID ^= desc.id
+			newDescs = append(newDescs, desc)
 		}
 
 		// Are all the label names and the help string consistent with
@@ -392,6 +395,7 @@ func (r *Registry) Register(c Collector) error {
 
 	// Only after all tests have passed, actually register.
 	r.collectorsByID[collectorID] = c
+	r.descsByID[collectorID] = newDescs
 	for hash := range newDescIDs {
 		r.descIDs[hash] = struct{}{}
 	}
@@ -432,6 +436,7 @@ func (r *Registry) Unregister(c Collector) bool {
 	defer r.mtx.Unlock()
 
 	delete(r.collectorsByID, collectorID)
+	delete(r.descsByID, collectorID)
 	if _, exists := r.expiredCleanersByID[collectorID]; exists {
 		delete(r.expiredCleanersByID, collectorID)
 		r.updateExpiredCleaners()
@@ -479,173 +484,6 @@ func (r *Registry) MustGather() []*dto.MetricFamily {
 	return mfs
 }
 
-// Gather implements Gatherer.
-//
-// Before Collect, Gather calls CleanupExpired on registered collectors that
-// implement ExpiredCleaner, so expired Vec metrics can be reclaimed on scrape.
-// This includes collectors registered through wrapping collectors and nested
-// registries. Cleanup panics are recovered and reported as collection errors.
-func (r *Registry) Gather() ([]*dto.MetricFamily, error) {
-	r.mtx.RLock()
-
-	if len(r.collectorsByID) == 0 && len(r.uncheckedCollectors) == 0 {
-		// Fast path.
-		r.mtx.RUnlock()
-		return nil, nil
-	}
-
-	xxh := xxhashPool.Get().(*xxhash.Digest)
-	defer xxhashPool.Put(xxh)
-
-	var (
-		checkedMetricChan   = make(chan Metric, capMetricChan)
-		uncheckedMetricChan = make(chan Metric, capMetricChan)
-		metricHashes        = make(map[uint64]struct{}, r.lastMetricCount.Load())
-		wg                  sync.WaitGroup
-		safeErrs            = &SafeMultiError{} // To collect errors in a threadsafe way
-		registeredDescIDs   map[uint64]struct{} // Only used for pedantic checks
-	)
-
-	goroutineBudget := len(r.collectorsByID) + len(r.uncheckedCollectors)
-	metricFamiliesByName := make(map[string]*dto.MetricFamily, len(r.dimHashesByName))
-	checkedCollectors := make(chan Collector, len(r.collectorsByID))
-	uncheckedCollectors := make(chan Collector, len(r.uncheckedCollectors))
-	for _, collector := range r.collectorsByID {
-		checkedCollectors <- collector
-	}
-	for _, collector := range r.uncheckedCollectors {
-		uncheckedCollectors <- collector
-	}
-	// In case pedantic checks are enabled, we have to copy the map before
-	// giving up the RLock.
-	if r.pedanticChecksEnabled {
-		registeredDescIDs = make(map[uint64]struct{}, len(r.descIDs))
-		for id := range r.descIDs {
-			registeredDescIDs[id] = struct{}{}
-		}
-	}
-	r.mtx.RUnlock()
-
-	wg.Add(goroutineBudget)
-
-	collectWorker := func() {
-		for {
-			select {
-			case collector := <-checkedCollectors:
-				safeErrs.Append(safeCollect(collector, checkedMetricChan))
-			case collector := <-uncheckedCollectors:
-				safeErrs.Append(safeCollect(collector, uncheckedMetricChan))
-			default:
-				return
-			}
-			wg.Done()
-		}
-	}
-
-	// Start the first worker now to make sure at least one is running.
-	go collectWorker()
-	goroutineBudget--
-
-	// Close checkedMetricChan and uncheckedMetricChan once all collectors
-	// are collected.
-	go func() {
-		wg.Wait()
-		close(checkedMetricChan)
-		close(uncheckedMetricChan)
-	}()
-
-	// Drain checkedMetricChan and uncheckedMetricChan in case of premature return.
-	defer func() {
-		if checkedMetricChan != nil {
-			for range checkedMetricChan {
-				continue
-			}
-		}
-		if uncheckedMetricChan != nil {
-			for range uncheckedMetricChan {
-				continue
-			}
-		}
-	}()
-
-	// Copy the channel references so we can nil them out later to remove
-	// them from the select statements below.
-	cmc := checkedMetricChan
-	umc := uncheckedMetricChan
-
-	for {
-		select {
-		case metric, ok := <-cmc:
-			if !ok {
-				cmc = nil
-				break
-			}
-			safeErrs.Append(processMetric(
-				metric, metricFamiliesByName,
-				metricHashes,
-				registeredDescIDs,
-				xxh,
-			))
-		case metric, ok := <-umc:
-			if !ok {
-				umc = nil
-				break
-			}
-			safeErrs.Append(processMetric(
-				metric, metricFamiliesByName,
-				metricHashes,
-				nil,
-				xxh,
-			))
-		default:
-			if goroutineBudget <= 0 || len(checkedCollectors)+len(uncheckedCollectors) == 0 {
-				// All collectors are already being worked on or
-				// we have already as many goroutines started as
-				// there are collectors. Do the same as above,
-				// just without the default.
-				select {
-				case metric, ok := <-cmc:
-					if !ok {
-						cmc = nil
-						break
-					}
-					safeErrs.Append(processMetric(
-						metric, metricFamiliesByName,
-						metricHashes,
-						registeredDescIDs,
-						xxh,
-					))
-				case metric, ok := <-umc:
-					if !ok {
-						umc = nil
-						break
-					}
-					safeErrs.Append(processMetric(
-						metric, metricFamiliesByName,
-						metricHashes,
-						nil,
-						xxh,
-					))
-				}
-				break
-			}
-			// Start more workers.
-			go collectWorker()
-			goroutineBudget--
-			runtime.Gosched()
-		}
-		// Once both checkedMetricChan and uncheckedMetricChan are closed
-		// and drained, the contraption above will nil out cmc and umc,
-		// and then we can leave the collect loop here.
-		if cmc == nil && umc == nil {
-			break
-		}
-	}
-
-	r.lastMetricCount.Store(int64(len(metricHashes)))
-	return internal.NormalizeMetricFamilies(metricFamiliesByName), safeErrs.errs.MaybeUnwrap()
-}
-
 // Describe implements Collector.
 func (r *Registry) Describe(ch chan<- *Desc) {
 	r.mtx.RLock()
@@ -656,25 +494,6 @@ func (r *Registry) Describe(ch chan<- *Desc) {
 	for _, c := range r.collectorsByID {
 		c.Describe(ch)
 	}
-}
-
-// Helper wrapper around Collector.Collect.
-// It tries to collect from the channel, recovers on panic and
-// if it has recovered from a panic, then it sends an InvalidMetric into
-// the channel with an InvalidDesc, and an error that includes a stack trace.
-func safeCollect(c Collector, ch chan<- Metric) (err error) {
-	defer func() {
-		if r := recover(); r != nil {
-			buf := make([]byte, 64<<10) //	64 KB
-			n := runtime.Stack(buf, false)
-			err = fmt.Errorf("prometheus collector panic recovered: type=%T: error=%v\nstack trace=%s", c, r, buf[:n])
-			ch <- NewInvalidMetric(NewInvalidDesc(err), err)
-		}
-	}()
-	cleanupWrappedExpired(c)
-	c.Collect(ch)
-
-	return err
 }
 
 // Unwrap collectors before cleaning up expired metrics.
@@ -768,9 +587,15 @@ func WriteToTextfile(filename string, g Gatherer) error {
 }
 
 // processMetric is an internal helper method only used by the Gather method.
+//
+// The collector argument is the Collector that produced the metric, and
+// familyOwners tracks which Collector created each metric family so that
+// conflicts between different Collectors can be attributed to both parties.
 func processMetric(
 	metric Metric,
+	collector Collector,
 	metricFamiliesByName map[string]*dto.MetricFamily,
+	familyOwners map[string]Collector,
 	metricHashes map[uint64]struct{},
 	registeredDescIDs map[uint64]struct{},
 	xxh *xxhash.Digest,
@@ -790,47 +615,66 @@ func processMetric(
 	}
 	metricFamily, ok := metricFamiliesByName[desc.fqName]
 	if ok { // Existing name.
+		owner := familyOwners[desc.fqName]
 		if metricFamily.GetHelp() != desc.help {
-			return fmt.Errorf(
-				"collected metric %s %s has help %q but should have %q",
-				desc.fqName, dtoMetric, desc.help, metricFamily.GetHelp(),
+			return conflictError(
+				desc.fqName, owner, collector,
+				fmt.Errorf(
+					"collected metric %s %s has help %q but should have %q",
+					desc.fqName, dtoMetric, desc.help, metricFamily.GetHelp(),
+				),
 			)
 		}
 		// TODO(beorn7): Simplify switch once Desc has type.
 		switch metricFamily.GetType() {
 		case dto.MetricType_COUNTER:
 			if dtoMetric.Counter == nil {
-				return fmt.Errorf(
-					"collected metric %s %s should be a Counter",
-					desc.fqName, dtoMetric,
+				return conflictError(
+					desc.fqName, owner, collector,
+					fmt.Errorf(
+						"collected metric %s %s should be a Counter",
+						desc.fqName, dtoMetric,
+					),
 				)
 			}
 		case dto.MetricType_GAUGE:
 			if dtoMetric.Gauge == nil {
-				return fmt.Errorf(
-					"collected metric %s %s should be a Gauge",
-					desc.fqName, dtoMetric,
+				return conflictError(
+					desc.fqName, owner, collector,
+					fmt.Errorf(
+						"collected metric %s %s should be a Gauge",
+						desc.fqName, dtoMetric,
+					),
 				)
 			}
 		case dto.MetricType_SUMMARY:
 			if dtoMetric.Summary == nil {
-				return fmt.Errorf(
-					"collected metric %s %s should be a Summary",
-					desc.fqName, dtoMetric,
+				return conflictError(
+					desc.fqName, owner, collector,
+					fmt.Errorf(
+						"collected metric %s %s should be a Summary",
+						desc.fqName, dtoMetric,
+					),
 				)
 			}
 		case dto.MetricType_UNTYPED:
 			if dtoMetric.Untyped == nil {
-				return fmt.Errorf(
-					"collected metric %s %s should be Untyped",
-					desc.fqName, dtoMetric,
+				return conflictError(
+					desc.fqName, owner, collector,
+					fmt.Errorf(
+						"collected metric %s %s should be Untyped",
+						desc.fqName, dtoMetric,
+					),
 				)
 			}
 		case dto.MetricType_HISTOGRAM:
 			if dtoMetric.Histogram == nil {
-				return fmt.Errorf(
-					"collected metric %s %s should be a Histogram",
-					desc.fqName, dtoMetric,
+				return conflictError(
+					desc.fqName, owner, collector,
+					fmt.Errorf(
+						"collected metric %s %s should be a Histogram",
+						desc.fqName, dtoMetric,
+					),
 				)
 			}
 		default:
@@ -859,9 +703,17 @@ func processMetric(
 			return fmt.Errorf("empty metric collected: %s", dtoMetric)
 		}
 		if err := checkSuffixCollisions(metricFamily, metricFamiliesByName); err != nil {
+			// Suffix collisions are conflicts between the new Collector and
+			// the Collector that owns the colliding family, if it is known.
+			if collidingName := collisionFamilyName(metricFamiliesByName, desc.fqName); collidingName != "" {
+				return conflictError(
+					desc.fqName, familyOwners[collidingName], collector, err,
+				)
+			}
 			return err
 		}
 		metricFamiliesByName[desc.fqName] = metricFamily
+		familyOwners[desc.fqName] = collector
 	}
 	if err := checkMetricConsistency(metricFamily, dtoMetric, metricHashes, xxh); err != nil {
 		return err

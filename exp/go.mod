@@ -9,4 +9,4 @@ require (
 	google.golang.org/protobuf v1.36.12
 )
 
-require github.com/prometheus/client_model v0.6.3 // indirect
+require github.com/prometheus/client_model v0.6.3

@@ -2,6 +2,8 @@
 
 * [CHANGE] Change required go.mod version to 1.26 #2138
 * [FEATURE] testutil: Add GatherAndFormat to encode a subset of metrics from a Gatherer. #2091
+* [FEATURE] prometheus: `Registry.Gather` now freezes the descriptor-to-collector mapping into an immutable snapshot at the start of each call, so concurrent `Register` and `Unregister` operations only affect later gathers and never change an in-flight generation. Add the additive `Registry.GatherWithContext` method, which stops invoking further Collectors after the context is canceled while retaining already processed metrics, and the `CollectorConflictError` type that names both Collectors involved in a cross-collector metric family conflict.
+* [FEATURE] exp/registry: Add experimental `ContextGatherer`, `ContextGathererFunc`, and `WithContext` for context-aware gathering. The package depends only on the stable `Gatherer` shape, so it works with any Gatherer implementation without coupling the exp module to a specific client_golang version.
 * [BUGFIX] **breaking** api/prometheus/v1: Fix `TSDBBlocks` so it can decode real server responses; fixes issues with data enveloping and aligns the TSDB Blocks struct types to match the upstream Prometheus counterpart. #1928
 * [BUGFIX] prometheus: `DeletePartialMatch` on a curried vector now deletes only metrics that carry the curried label values. Before, it could also delete matching metrics with other values for the curried labels. #2202
 * [BUGFIX] prometheus: `MetricVec` no longer holds its lock while `Collect` sends metrics to `Gather`, so a slow or blocked `Metric.Write` during a scrape no longer blocks `WithLabelValues` and other calls on the vector. #2157
