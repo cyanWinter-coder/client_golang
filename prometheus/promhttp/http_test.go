@@ -16,6 +16,7 @@ package promhttp
 import (
 	"bytes"
 	"compress/gzip"
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -1829,5 +1830,430 @@ func TestCoalesceGatherCallersGetDistinctSlices(t *testing.T) {
 	r1.mfs[0] = nil
 	if r2.mfs[0] == nil {
 		t.Error("callers share a slice backing array; each caller must get its own copy")
+	}
+}
+
+// staticTransactionalGatherer returns a fixed snapshot of metric families and
+// counts Gather and done invocations. Safe for concurrent use.
+type staticTransactionalGatherer struct {
+	mfs          []*dto.MetricFamily
+	gatherCalled atomic.Int64
+	doneCalled   atomic.Int64
+}
+
+func (g *staticTransactionalGatherer) Gather() ([]*dto.MetricFamily, func(), error) {
+	g.gatherCalled.Add(1)
+	return g.mfs, func() { g.doneCalled.Add(1) }, nil
+}
+
+// makeTestMetricFamilies returns n gauge families named test_metric_<i>, each
+// with a single series.
+func makeTestMetricFamilies(n int) []*dto.MetricFamily {
+	mfs := make([]*dto.MetricFamily, n)
+	for i := range n {
+		mfs[i] = &dto.MetricFamily{
+			Name: new(fmt.Sprintf("test_metric_%d", i)),
+			Help: new("A test metric."),
+			Type: dto.MetricType_GAUGE.Enum(),
+			Metric: []*dto.Metric{
+				{Gauge: &dto.Gauge{Value: new(float64(i))}},
+			},
+		}
+	}
+	return mfs
+}
+
+// readResponseBody returns the response body decoded according to the
+// response's Content-Encoding header value.
+func readResponseBody(t *testing.T, r io.Reader, contentEncoding string) string {
+	t.Helper()
+	switch contentEncoding {
+	case string(Gzip), string(Zstd):
+		body, err := readCompressedBody(r, Compression(contentEncoding))
+		if err != nil {
+			t.Fatalf("error decoding %s body: %v", contentEncoding, err)
+		}
+		return body
+	default:
+		body, err := io.ReadAll(r)
+		if err != nil {
+			t.Fatalf("error reading body: %v", err)
+		}
+		return string(body)
+	}
+}
+
+// cancelAfterErrCallsContext reports cancellation after its Err method has
+// been called a configurable number of times. It lets tests deterministically
+// cancel a request partway through the handler, which checks the request
+// context once per encoded metric family and once before writing.
+type cancelAfterErrCallsContext struct {
+	context.Context
+	failAfter int
+	mu        sync.Mutex
+	calls     int
+}
+
+func (c *cancelAfterErrCallsContext) Err() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.calls++
+	if c.calls > c.failAfter {
+		return context.Canceled
+	}
+	return c.Context.Err()
+}
+
+// blockingResponseWriter blocks in Write until released. It lets tests
+// observe the handler state while a slow client is being served.
+type blockingResponseWriter struct {
+	header       http.Header
+	writeStarted chan struct{}
+	unblock      chan struct{}
+	startOnce    sync.Once
+	code         int
+	body         bytes.Buffer
+}
+
+func newBlockingResponseWriter() *blockingResponseWriter {
+	return &blockingResponseWriter{
+		header:       http.Header{},
+		writeStarted: make(chan struct{}),
+		unblock:      make(chan struct{}),
+	}
+}
+
+func (w *blockingResponseWriter) Header() http.Header { return w.header }
+
+func (w *blockingResponseWriter) WriteHeader(code int) { w.code = code }
+
+func (w *blockingResponseWriter) Write(b []byte) (int, error) {
+	w.startOnce.Do(func() { close(w.writeStarted) })
+	<-w.unblock
+	return w.body.Write(b)
+}
+
+// TestHandlerCancellationStopsEncoding verifies that a cancelled request stops
+// encoding, writes no partial payload, still releases the gather snapshot
+// exactly once, and does not hand its half-finished buffer to a subsequent
+// request. This holds identically for all content encodings.
+func TestHandlerCancellationStopsEncoding(t *testing.T) {
+	defer goleak.VerifyNone(t)
+
+	const numFamilies = 10
+
+	encodings := []struct {
+		name           string
+		acceptEncoding string
+	}{
+		{name: "identity"},
+		{name: "gzip", acceptEncoding: "gzip"},
+		{name: "zstd", acceptEncoding: "zstd"},
+	}
+	cancelPoints := []struct {
+		name string
+		// failAfter is the number of Err calls allowed before the context
+		// reports cancellation. The handler checks the request context once
+		// per metric family and once before writing the encoded payload.
+		failAfter int
+	}{
+		{name: "before encoding", failAfter: 0},
+		{name: "mid encoding", failAfter: 3},
+		{name: "after encoding", failAfter: numFamilies},
+	}
+
+	for _, enc := range encodings {
+		for _, cp := range cancelPoints {
+			t.Run(enc.name+"/"+cp.name, func(t *testing.T) {
+				g := &staticTransactionalGatherer{mfs: makeTestMetricFamilies(numFamilies)}
+				handler := HandlerForTransactional(g, HandlerOpts{})
+
+				req, _ := http.NewRequest(http.MethodGet, "/", nil)
+				req.Header.Add(acceptHeader, acceptTextPlain)
+				if enc.acceptEncoding != "" {
+					req.Header.Add(acceptEncodingHeader, enc.acceptEncoding)
+				}
+				req = req.WithContext(&cancelAfterErrCallsContext{Context: req.Context(), failAfter: cp.failAfter})
+
+				w := httptest.NewRecorder()
+				handler.ServeHTTP(w, req)
+
+				if got := g.gatherCalled.Load(); got != 1 {
+					t.Errorf("Gather called %d times, want 1", got)
+				}
+				if got := g.doneCalled.Load(); got != 1 {
+					t.Errorf("done called %d times, want 1", got)
+				}
+				if got := w.Body.Len(); got != 0 {
+					t.Errorf("cancelled request wrote %d bytes, want no partial payload", got)
+				}
+
+				// A subsequent request must get a complete, valid payload:
+				// the half-finished buffer of the cancelled request must not
+				// have been reused.
+				req2, _ := http.NewRequest(http.MethodGet, "/", nil)
+				req2.Header.Add(acceptHeader, acceptTextPlain)
+				if enc.acceptEncoding != "" {
+					req2.Header.Add(acceptEncodingHeader, enc.acceptEncoding)
+				}
+				w2 := httptest.NewRecorder()
+				handler.ServeHTTP(w2, req2)
+
+				if got, want := w2.Code, http.StatusOK; got != want {
+					t.Fatalf("follow-up request: HTTP status %d, want %d", got, want)
+				}
+				body := readResponseBody(t, w2.Body, w2.Header().Get(contentEncodingHeader))
+				for i := range numFamilies {
+					if want := fmt.Sprintf("test_metric_%d", i); !strings.Contains(body, want) {
+						t.Errorf("follow-up body does not contain %q", want)
+					}
+				}
+			})
+		}
+	}
+}
+
+// TestHandlerReleasesGatherSnapshotBeforeClientWrite verifies that the gather
+// snapshot is released (done is called) as soon as the response is encoded,
+// before the handler blocks writing to a slow client.
+func TestHandlerReleasesGatherSnapshotBeforeClientWrite(t *testing.T) {
+	defer goleak.VerifyNone(t)
+
+	g := &staticTransactionalGatherer{mfs: makeTestMetricFamilies(3)}
+	handler := HandlerForTransactional(g, HandlerOpts{})
+
+	req, _ := http.NewRequest(http.MethodGet, "/", nil)
+	req.Header.Add(acceptHeader, acceptTextPlain)
+	req.Header.Add(acceptEncodingHeader, "gzip")
+
+	w := newBlockingResponseWriter()
+	served := make(chan struct{})
+	go func() {
+		handler.ServeHTTP(w, req)
+		close(served)
+	}()
+
+	// Wait until the handler blocks writing to the slow client.
+	<-w.writeStarted
+
+	// The gather snapshot must already be released: a slow client must not
+	// hold gather-side resources while the response trickles out.
+	if got := g.doneCalled.Load(); got != 1 {
+		t.Errorf("done called %d times while client write is blocked, want 1", got)
+	}
+
+	close(w.unblock)
+	<-served
+
+	// Capture the encoded length before decoding consumes the buffer.
+	wantContentLength := strconv.Itoa(w.body.Len())
+	body := readResponseBody(t, &w.body, w.header.Get(contentEncodingHeader))
+	if want := "test_metric_2"; !strings.Contains(body, want) {
+		t.Errorf("body does not contain %q", want)
+	}
+	if got := w.header.Get(contentLengthHeader); got != wantContentLength {
+		t.Errorf("Content-Length header %q, want %q (encoded body length)", got, wantContentLength)
+	}
+}
+
+// TestHandlerConcurrentSlowClientsEncodeIndependently verifies that concurrent
+// requests each encode their own payload and release their own gather
+// snapshot, so slow consumers do not block the encoding of other requests.
+func TestHandlerConcurrentSlowClientsEncodeIndependently(t *testing.T) {
+	defer goleak.VerifyNone(t)
+
+	const numRequests = 8
+	g := &staticTransactionalGatherer{mfs: makeTestMetricFamilies(5)}
+	handler := HandlerForTransactional(g, HandlerOpts{})
+
+	writers := make([]*blockingResponseWriter, numRequests)
+	served := make(chan struct{}, numRequests)
+	for i := range numRequests {
+		writers[i] = newBlockingResponseWriter()
+		go func(w *blockingResponseWriter) {
+			req, _ := http.NewRequest(http.MethodGet, "/", nil)
+			req.Header.Add(acceptHeader, acceptTextPlain)
+			req.Header.Add(acceptEncodingHeader, "gzip")
+			handler.ServeHTTP(w, req)
+			served <- struct{}{}
+		}(writers[i])
+	}
+
+	// Every request must reach its client write without waiting for the
+	// other (blocked) clients: encoding is paid per request and each gather
+	// snapshot is released before its write.
+	for _, w := range writers {
+		<-w.writeStarted
+	}
+	if got := g.doneCalled.Load(); got != numRequests {
+		t.Errorf("done called %d times with all clients blocked, want %d", got, numRequests)
+	}
+
+	for _, w := range writers {
+		close(w.unblock)
+	}
+	for range numRequests {
+		<-served
+	}
+	for i, w := range writers {
+		body := readResponseBody(t, &w.body, w.header.Get(contentEncodingHeader))
+		if want := "test_metric_4"; !strings.Contains(body, want) {
+			t.Errorf("request %d: body does not contain %q", i, want)
+		}
+	}
+}
+
+// TestHandlerEncodingErrorUniformAcrossEncodings verifies that a metric
+// family that fails to encode is handled with the same response and error
+// semantics for identity, gzip, and zstd encodings.
+func TestHandlerEncodingErrorUniformAcrossEncodings(t *testing.T) {
+	// brokenFamily fails text encoding because it carries no metrics.
+	brokenFamily := func() *dto.MetricFamily {
+		return &dto.MetricFamily{
+			Name: new("broken_family"),
+			Help: new("A family that fails to encode."),
+			Type: dto.MetricType_GAUGE.Enum(),
+		}
+	}
+	goodFamily := func(name string) *dto.MetricFamily {
+		return &dto.MetricFamily{
+			Name: new(name),
+			Help: new("A test metric."),
+			Type: dto.MetricType_GAUGE.Enum(),
+			Metric: []*dto.Metric{
+				{Gauge: &dto.Gauge{Value: new(float64(1))}},
+			},
+		}
+	}
+
+	encodings := []struct {
+		name           string
+		acceptEncoding string
+	}{
+		{name: "identity"},
+		{name: "gzip", acceptEncoding: "gzip"},
+		{name: "zstd", acceptEncoding: "zstd"},
+	}
+
+	newRequest := func(acceptEncoding string) *http.Request {
+		req, _ := http.NewRequest(http.MethodGet, "/", nil)
+		req.Header.Add(acceptHeader, acceptTextPlain)
+		if acceptEncoding != "" {
+			req.Header.Add(acceptEncodingHeader, acceptEncoding)
+		}
+		return req
+	}
+
+	t.Run("HTTPErrorOnError serves 500 for every encoding", func(t *testing.T) {
+		for _, enc := range encodings {
+			t.Run(enc.name, func(t *testing.T) {
+				g := &staticTransactionalGatherer{mfs: []*dto.MetricFamily{brokenFamily()}}
+				handler := HandlerForTransactional(g, HandlerOpts{ErrorHandling: HTTPErrorOnError})
+
+				w := httptest.NewRecorder()
+				handler.ServeHTTP(w, newRequest(enc.acceptEncoding))
+
+				if got, want := w.Code, http.StatusInternalServerError; got != want {
+					t.Errorf("HTTP status %d, want %d", got, want)
+				}
+				if body := w.Body.String(); !strings.Contains(body, "An error has occurred while serving metrics") {
+					t.Errorf("body %q does not report the serving error", body)
+				}
+				if got := w.Header().Get(contentEncodingHeader); got != "" {
+					t.Errorf("Content-Encoding header %q set on error response, want none", got)
+				}
+				if got := g.doneCalled.Load(); got != 1 {
+					t.Errorf("done called %d times, want 1", got)
+				}
+			})
+		}
+	})
+
+	t.Run("ContinueOnError serves the remaining families", func(t *testing.T) {
+		for _, enc := range encodings {
+			t.Run(enc.name, func(t *testing.T) {
+				g := &staticTransactionalGatherer{mfs: []*dto.MetricFamily{
+					goodFamily("good_metric_1"),
+					brokenFamily(),
+					goodFamily("good_metric_2"),
+				}}
+				handler := HandlerForTransactional(g, HandlerOpts{ErrorHandling: ContinueOnError})
+
+				w := httptest.NewRecorder()
+				handler.ServeHTTP(w, newRequest(enc.acceptEncoding))
+
+				if got, want := w.Code, http.StatusOK; got != want {
+					t.Errorf("HTTP status %d, want %d", got, want)
+				}
+				if got, want := w.Header().Get(contentEncodingHeader), enc.acceptEncoding; got != want {
+					t.Errorf("Content-Encoding header %q, want %q", got, want)
+				}
+				body := readResponseBody(t, w.Body, enc.acceptEncoding)
+				for _, want := range []string{"good_metric_1", "good_metric_2"} {
+					if !strings.Contains(body, want) {
+						t.Errorf("body does not contain %q", want)
+					}
+				}
+				if got := g.doneCalled.Load(); got != 1 {
+					t.Errorf("done called %d times, want 1", got)
+				}
+			})
+		}
+	})
+}
+
+// TestHandlerResponseHeadersAcrossEncodings verifies that identity, gzip, and
+// zstd responses carry the same header semantics (Content-Type, Vary, and a
+// Content-Length matching the encoded body) and decode to the same payload.
+func TestHandlerResponseHeadersAcrossEncodings(t *testing.T) {
+	g := &staticTransactionalGatherer{mfs: makeTestMetricFamilies(3)}
+	handler := HandlerForTransactional(g, HandlerOpts{})
+
+	var (
+		wantBody        string
+		wantContentType string
+	)
+	for _, enc := range []struct {
+		name           string
+		acceptEncoding string
+		wantEncoding   string
+	}{
+		{name: "identity"},
+		{name: "gzip", acceptEncoding: "gzip", wantEncoding: "gzip"},
+		{name: "zstd", acceptEncoding: "zstd", wantEncoding: "zstd"},
+	} {
+		t.Run(enc.name, func(t *testing.T) {
+			req, _ := http.NewRequest(http.MethodGet, "/", nil)
+			req.Header.Add(acceptHeader, acceptTextPlain)
+			if enc.acceptEncoding != "" {
+				req.Header.Add(acceptEncodingHeader, enc.acceptEncoding)
+			}
+			w := httptest.NewRecorder()
+			handler.ServeHTTP(w, req)
+
+			if got, want := w.Code, http.StatusOK; got != want {
+				t.Fatalf("HTTP status %d, want %d", got, want)
+			}
+			if got := w.Header().Get(contentEncodingHeader); got != enc.wantEncoding {
+				t.Errorf("Content-Encoding %q, want %q", got, enc.wantEncoding)
+			}
+			if got, want := w.Header().Get(contentLengthHeader), strconv.Itoa(w.Body.Len()); got != want {
+				t.Errorf("Content-Length %q, want %q (encoded body length)", got, want)
+			}
+			if got, want := strings.Join(w.Header().Values(varyHeader), ", "), "Accept, Accept-Encoding"; got != want {
+				t.Errorf("Vary %q, want %q", got, want)
+			}
+			if got := w.Header().Get(contentTypeHeader); wantContentType == "" {
+				wantContentType = got
+			} else if got != wantContentType {
+				t.Errorf("Content-Type %q differs across encodings, want %q", got, wantContentType)
+			}
+			body := readResponseBody(t, w.Body, enc.wantEncoding)
+			if wantBody == "" {
+				wantBody = body
+			} else if body != wantBody {
+				t.Errorf("decoded body differs across encodings")
+			}
+		})
 	}
 }

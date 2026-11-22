@@ -32,6 +32,7 @@
 package promhttp
 
 import (
+	"bytes"
 	"compress/gzip"
 	"errors"
 	"fmt"
@@ -55,6 +56,7 @@ const (
 	acceptHeader           = "Accept"
 	contentTypeHeader      = "Content-Type"
 	contentEncodingHeader  = "Content-Encoding"
+	contentLengthHeader    = "Content-Length"
 	acceptEncodingHeader   = "Accept-Encoding"
 	processStartTimeHeader = "Process-Start-Time-Unix"
 	varyHeader             = "Vary"
@@ -81,6 +83,29 @@ var gzipPool = sync.Pool{
 	New: func() any {
 		gz, _ := gzip.NewWriterLevel(nil, gzip.BestSpeed)
 		return gz
+	},
+}
+
+const (
+	// initialEncodeBufSize is the capacity of a freshly pooled encode
+	// buffer. It is sized to hold a typical /metrics response without
+	// reallocation.
+	initialEncodeBufSize = 32 << 10
+	// maxPooledEncodeBufSize bounds the capacity of encode buffers returned
+	// to encodeBufPool. Buffers that grew beyond it (from unusually large
+	// payloads) are dropped for the GC instead, so that a single huge
+	// response cannot pin memory in the pool for the process lifetime.
+	maxPooledEncodeBufSize = 4 << 20
+)
+
+// encodeBufPool pools the per-request buffers the metrics payload is
+// encoded (and compressed) into before it is written to the client. A
+// buffer is returned to the pool only after its fully encoded payload has
+// been written out. Buffers of aborted requests are dropped for the GC, so
+// a half-finished payload is never reused by a subsequent request.
+var encodeBufPool = sync.Pool{
+	New: func() any {
+		return bytes.NewBuffer(make([]byte, 0, initialEncodeBufSize))
 	},
 }
 
@@ -236,6 +261,14 @@ func HandlerFor(reg prometheus.Gatherer, opts HandlerOpts) http.Handler {
 // can safely change in-place returned *dto.MetricFamily before call to `Gather` and after
 // call to `done` of that `Gather`.
 //
+// The handler gathers the metric snapshot once per request, encodes and
+// optionally compresses it into a per-request buffer, and only then writes
+// the response. The gather snapshot is released (done is called) as soon as
+// encoding completes, before anything is written to the client, so a slow or
+// cancelled client cannot hold gather-side resources. Encoding stops when
+// the request context is cancelled, and the half-finished buffer of an
+// aborted request is discarded rather than reused.
+//
 // The handler supports filtering metrics by name using the `name[]` query parameter.
 // Multiple metric names can be specified by providing the parameter multiple times.
 // When no name[] parameters are provided, all metrics are returned.
@@ -300,7 +333,20 @@ func HandlerForTransactional(reg prometheus.TransactionalGatherer, opts HandlerO
 			}
 		}
 		mfs, done, err := reg.Gather()
-		defer done()
+		// release hands the gather snapshot back exactly once. It is called
+		// as soon as the response is fully encoded, before anything is
+		// written to the client, so that a slow or gone client cannot hold
+		// gather-side resources (e.g. the state a TransactionalGatherer
+		// pins between Gather and done). The deferred call covers the
+		// error and panic paths and is a no-op after the explicit release.
+		released := false
+		release := func() {
+			if !released {
+				released = true
+				done()
+			}
+		}
+		defer release()
 		if err != nil {
 			if opts.ErrorLog != nil {
 				opts.ErrorLog.Println("error gathering metrics:", err)
@@ -333,27 +379,58 @@ func HandlerForTransactional(reg prometheus.TransactionalGatherer, opts HandlerO
 			}
 		}
 		contentType = expfmt.NegotiateAccept(req.Header, acceptedFormats...)
+		// Vary is derived from the request, not the payload, so it is set
+		// even on responses aborted before encoding completes.
 		rsp.Header().Add(varyHeader, acceptHeader)
 		if len(compressions) > 0 {
 			rsp.Header().Add(varyHeader, acceptEncodingHeader)
 		}
-		rsp.Header().Set(contentTypeHeader, string(contentType))
 
-		w, encodingHeader, closeWriter, err := negotiateEncodingWriter(req, rsp, compressions)
+		// Build metric name filter set from query params (if any). The URL
+		// can be nil on hand-constructed requests.
+		var metricFilter map[string]struct{}
+		if req.URL != nil {
+			if metricNames := req.URL.Query()["name[]"]; len(metricNames) > 0 {
+				metricFilter = make(map[string]struct{}, len(metricNames))
+				for _, name := range metricNames {
+					metricFilter[name] = struct{}{}
+				}
+			}
+		}
+
+		// Encode the gathered snapshot into a per-request buffer first and
+		// serve the client from that buffer. Each request pays its own
+		// encoding cost, independent of concurrent requests, and the buffer
+		// is the single owner of the encoded payload: it is returned to the
+		// pool only after the complete payload has been written out.
+		buf := encodeBufPool.Get().(*bytes.Buffer)
+		buf.Reset()
+		written := false
+		defer func() {
+			if written && buf.Cap() <= maxPooledEncodeBufSize {
+				encodeBufPool.Put(buf)
+			}
+		}()
+
+		w, encodingHeader, closeWriter, err := negotiateEncodingWriter(req, buf, compressions)
 		if err != nil {
 			if opts.ErrorLog != nil {
 				opts.ErrorLog.Println("error getting writer", err)
 			}
-			w = io.Writer(rsp)
+			w = buf
 			encodingHeader = string(Identity)
 		}
-
-		defer closeWriter()
-
-		// Set Content-Encoding only when data is compressed
-		if encodingHeader != string(Identity) {
-			rsp.Header().Set(contentEncodingHeader, encodingHeader)
+		// closeWriterOnce flushes and closes the compression writer exactly
+		// once. It must run on every path, including panics, so that encoder
+		// resources (e.g. the zstd encoder goroutine) are never leaked.
+		closed := false
+		closeWriterOnce := func() {
+			if !closed {
+				closed = true
+				closeWriter()
+			}
 		}
+		defer closeWriterOnce()
 
 		var (
 			enc     expfmt.Encoder
@@ -378,30 +455,26 @@ func HandlerForTransactional(reg prometheus.TransactionalGatherer, opts HandlerO
 			case PanicOnError:
 				panic(err)
 			case HTTPErrorOnError:
-				// We cannot really send an HTTP error at this
-				// point because we most likely have written
-				// something to rsp already. But at least we can
-				// stop sending.
+				// The payload is encoded before anything is written to the
+				// client, so an encoding failure can still be reported as an
+				// HTTP error, with the same semantics for every content
+				// encoding.
+				httpError(rsp, err)
 				return true
 			}
 			// Do nothing in all other cases, including ContinueOnError.
 			return false
 		}
 
-		// Build metric name filter set from query params (if any). The URL
-		// can be nil on hand-constructed requests.
-		var metricFilter map[string]struct{}
-		if req.URL != nil {
-			if metricNames := req.URL.Query()["name[]"]; len(metricNames) > 0 {
-				metricFilter = make(map[string]struct{}, len(metricNames))
-				for _, name := range metricNames {
-					metricFilter[name] = struct{}{}
-				}
-			}
-		}
-
+		ctx := req.Context()
 		shouldTruncExemplars := isOpenMetrics1(contentType)
 		for _, mf := range mfs {
+			// Stop encoding once the client is gone or the request deadline
+			// has been exceeded. The half-finished buffer is discarded, not
+			// returned to the pool.
+			if ctx.Err() != nil {
+				return
+			}
 			if metricFilter != nil {
 				if _, ok := metricFilter[mf.GetName()]; !ok {
 					continue
@@ -420,6 +493,41 @@ func HandlerForTransactional(reg prometheus.TransactionalGatherer, opts HandlerO
 				return
 			}
 		}
+		// Flush the compression trailer into buf and release the encoder.
+		closeWriterOnce()
+
+		// The payload is complete. Release the gather snapshot before
+		// writing anything to the client.
+		release()
+
+		// Nothing has been written yet, so the header set can still be
+		// completed uniformly for all content encodings.
+		rsp.Header().Set(contentTypeHeader, string(contentType))
+		// Set Content-Encoding only when data is compressed.
+		if encodingHeader != string(Identity) {
+			rsp.Header().Set(contentEncodingHeader, encodingHeader)
+		}
+		rsp.Header().Set(contentLengthHeader, strconv.Itoa(buf.Len()))
+
+		// Propagate a request deadline (if any) to the write, so that a
+		// blocked client connection cannot hold this handler past the
+		// request's lifetime. Best effort: not every ResponseWriter
+		// supports write deadlines.
+		if deadline, ok := ctx.Deadline(); ok {
+			_ = http.NewResponseController(rsp).SetWriteDeadline(deadline)
+		}
+		// Do not write a payload the client is no longer waiting for.
+		if ctx.Err() != nil {
+			return
+		}
+		if _, err := rsp.Write(buf.Bytes()); err != nil {
+			if opts.ErrorLog != nil {
+				opts.ErrorLog.Println("error writing metrics response:", err)
+			}
+			errCnt.WithLabelValues("encoding").Inc()
+			return
+		}
+		written = true
 	})
 
 	if opts.Timeout <= 0 {
@@ -492,12 +600,11 @@ type HandlerErrorHandling int
 // errors are encountered.
 const (
 	// Serve an HTTP status code 500 upon the first error
-	// encountered. Report the error message in the body. Note that HTTP
-	// errors cannot be served anymore once the beginning of a regular
-	// payload has been sent. Thus, in the (unlikely) case that encoding the
-	// payload into the negotiated wire format fails, serving the response
-	// will simply be aborted. Set an ErrorLog in HandlerOpts to detect
-	// those errors.
+	// encountered. Report the error message in the body. The handler
+	// encodes the whole payload before sending anything, so encoding
+	// failures are still reported as HTTP errors. Only errors while
+	// writing the encoded payload to the client cannot be served as HTTP
+	// errors anymore. Set an ErrorLog in HandlerOpts to detect those.
 	HTTPErrorOnError HandlerErrorHandling = iota
 	// Ignore errors and try to serve as many metrics as possible.  However,
 	// if no metrics can be served, serve an HTTP status code 500 and the
@@ -605,9 +712,11 @@ type HandlerOpts struct {
 	// described above (and even that only if sending of the body hasn't
 	// started yet), while the bulk work of gathering all the metrics keeps
 	// running in the background (with the eventual result to be thrown
-	// away). When CoalesceGather is enabled, only one such background Gather
-	// can be in flight at a time. It is also recommended to implement a
-	// separate timeout in potentially slow Collectors.
+	// away), while encoding of an already gathered snapshot stops as soon
+	// as the request context is cancelled. When CoalesceGather is enabled,
+	// only one such background Gather can be in flight at a time. It is
+	// also recommended to implement a separate timeout in potentially slow
+	// Collectors.
 	Timeout time.Duration
 	// If true, the experimental OpenMetrics encoding is added to the
 	// possible options during content negotiation. Note that Prometheus

@@ -5,6 +5,7 @@
 * [BUGFIX] **breaking** api/prometheus/v1: Fix `TSDBBlocks` so it can decode real server responses; fixes issues with data enveloping and aligns the TSDB Blocks struct types to match the upstream Prometheus counterpart. #1928
 * [BUGFIX] prometheus: `DeletePartialMatch` on a curried vector now deletes only metrics that carry the curried label values. Before, it could also delete matching metrics with other values for the curried labels. #2202
 * [BUGFIX] prometheus: `MetricVec` no longer holds its lock while `Collect` sends metrics to `Gather`, so a slow or blocked `Metric.Write` during a scrape no longer blocks `WithLabelValues` and other calls on the vector. #2157
+* [CHANGE] promhttp: The metrics handler now encodes and compresses the gathered snapshot into a per-request buffer before writing the response. The gather snapshot is released (`done` is called) as soon as encoding completes, so slow or cancelled clients no longer hold gather-side resources; encoding stops when the request context is cancelled and the half-finished buffer is discarded rather than reused; encoding failures are reported as HTTP 500 for all content encodings (identity, gzip, zstd) instead of a truncated response; and responses now carry a `Content-Length` header.
 
 ## 1.24.1 / 2026-07-23
 
