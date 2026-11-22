@@ -2,6 +2,7 @@
 
 * [CHANGE] Change required go.mod version to 1.26 #2138
 * [FEATURE] testutil: Add GatherAndFormat to encode a subset of metrics from a Gatherer. #2091
+* [FEATURE] prometheus/push: Add opt-in retries via `New`'s `PusherOption`s `WithRetryPolicy` and `WithTimeout`. Every operation captures an immutable snapshot of the grouping key, body, headers, credentials, and client, so a retry re-sends the identical request; retryable requests are sent on fresh connections and failed, cancelled, or timed-out exchanges do not return half-uploaded connections to the pool. The zero-value `RetryPolicy` keeps the previous single-attempt behavior, and `Delete` retries remain idempotent because only a `202 Accepted` is treated as success.
 * [BUGFIX] **breaking** api/prometheus/v1: Fix `TSDBBlocks` so it can decode real server responses; fixes issues with data enveloping and aligns the TSDB Blocks struct types to match the upstream Prometheus counterpart. #1928
 * [BUGFIX] prometheus: `DeletePartialMatch` on a curried vector now deletes only metrics that carry the curried label values. Before, it could also delete matching metrics with other values for the curried labels. #2202
 * [BUGFIX] prometheus: `MetricVec` no longer holds its lock while `Collect` sends metrics to `Gather`, so a slow or blocked `Metric.Write` during a scrape no longer blocks `WithLabelValues` and other calls on the vector. #2157

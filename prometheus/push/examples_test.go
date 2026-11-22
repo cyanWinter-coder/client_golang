@@ -15,6 +15,7 @@ package push_test
 
 import (
 	"fmt"
+	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/push"
@@ -29,6 +30,26 @@ func ExamplePusher_Push() {
 	if err := push.New("http://pushgateway:9091", "db_backup").
 		Collector(completionTime).
 		Grouping("db", "customers").
+		Push(); err != nil {
+		fmt.Println("Could not push completion time to Pushgateway:", err)
+	}
+}
+
+func ExampleWithRetryPolicy() {
+	completionTime := prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "db_backup_last_completion_timestamp_seconds",
+		Help: "The timestamp of the last successful completion of a DB backup.",
+	})
+	completionTime.SetToCurrentTime()
+	if err := push.New("http://pushgateway:9091", "db_backup",
+		// Retry a failed push on a fresh connection. Every attempt sends the
+		// same grouping key, headers, credentials, and body, so a retry is
+		// safe for PUT, POST, and DELETE.
+		push.WithRetryPolicy(push.DefaultRetryPolicy()),
+		// Bound the whole operation, including the retry backoff.
+		push.WithTimeout(10*time.Second),
+	).
+		Collector(completionTime).
 		Push(); err != nil {
 		fmt.Println("Could not push completion time to Pushgateway:", err)
 	}
