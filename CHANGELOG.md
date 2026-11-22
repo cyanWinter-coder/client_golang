@@ -2,6 +2,7 @@
 
 * [CHANGE] Change required go.mod version to 1.26 #2138
 * [FEATURE] testutil: Add GatherAndFormat to encode a subset of metrics from a Gatherer. #2091
+* [FEATURE] testutil/promlint: Add `Linter.Scan` and `testutil.CollectAndScan`/`GatherAndScan` to report every lint finding in one pass as structured `Diagnostic` values with a stable rule code, severity, and field path. Findings are sorted deterministically and a malformed metric no longer prevents the remaining metrics from being reported. `Lint`, `Problem` and the `Validation` contract are unchanged. #2210
 * [BUGFIX] **breaking** api/prometheus/v1: Fix `TSDBBlocks` so it can decode real server responses; fixes issues with data enveloping and aligns the TSDB Blocks struct types to match the upstream Prometheus counterpart. #1928
 * [BUGFIX] prometheus: `DeletePartialMatch` on a curried vector now deletes only metrics that carry the curried label values. Before, it could also delete matching metrics with other values for the curried labels. #2202
 * [BUGFIX] prometheus: `MetricVec` no longer holds its lock while `Collect` sends metrics to `Gather`, so a slow or blocked `Metric.Write` during a scrape no longer blocks `WithLabelValues` and other calls on the vector. #2157

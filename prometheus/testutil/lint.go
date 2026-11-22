@@ -14,6 +14,7 @@
 package testutil
 
 import (
+	"context"
 	"fmt"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -43,4 +44,36 @@ func GatherAndLint(g prometheus.Gatherer, metricNames ...string) ([]promlint.Pro
 		got = filterMetrics(got, metricNames)
 	}
 	return promlint.NewWithMetricFamilies(got).Lint()
+}
+
+// CollectAndScan registers the provided Collector with a newly created
+// pedantic Registry. It then calls GatherAndScan with that Registry and with
+// the provided metricNames.
+//
+// Unlike CollectAndLint, the returned diagnostics carry a stable rule code,
+// severity, and field path, and every finding is reported instead of only the
+// first one per metric family.
+func CollectAndScan(ctx context.Context, c prometheus.Collector, metricNames ...string) ([]promlint.Diagnostic, error) {
+	reg := prometheus.NewPedanticRegistry()
+	if err := reg.Register(c); err != nil {
+		return nil, fmt.Errorf("registering collector failed: %w", err)
+	}
+	return GatherAndScan(ctx, reg, metricNames...)
+}
+
+// GatherAndScan gathers all metrics from the provided Gatherer and checks them
+// with the structured scanner in the promlint package. If any metricNames are
+// provided, only metrics with those names are checked.
+//
+// The scan stops promptly and returns the diagnostics collected so far when
+// ctx is canceled.
+func GatherAndScan(ctx context.Context, g prometheus.Gatherer, metricNames ...string) ([]promlint.Diagnostic, error) {
+	got, err := g.Gather()
+	if err != nil {
+		return nil, fmt.Errorf("gathering metrics failed: %w", err)
+	}
+	if metricNames != nil {
+		got = filterMetrics(got, metricNames)
+	}
+	return promlint.NewWithMetricFamilies(got).Scan(ctx)
 }

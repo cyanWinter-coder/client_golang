@@ -14,8 +14,6 @@
 package validations
 
 import (
-	"errors"
-	"fmt"
 	"regexp"
 	"strings"
 
@@ -28,7 +26,7 @@ var camelCase = regexp.MustCompile(`[a-z][A-Z]`)
 func LintMetricUnits(mf *dto.MetricFamily) []error {
 	var problems []error
 
-	unit, base, ok := metricUnits(*mf.Name)
+	unit, base, ok := metricUnits(mf.GetName())
 	if !ok {
 		// No known units detected.
 		return nil
@@ -39,7 +37,7 @@ func LintMetricUnits(mf *dto.MetricFamily) []error {
 		return nil
 	}
 
-	problems = append(problems, fmt.Errorf("use base unit %q instead of %q", base, unit))
+	problems = append(problems, NewIssuef(RuleMetricUnits, SeverityWarning, pathName, "use base unit %q instead of %q", base, unit))
 
 	return problems
 }
@@ -56,7 +54,7 @@ func LintMetricTypeInName(mf *dto.MetricFamily) []error {
 	typename := strings.ToLower(mf.GetType().String())
 
 	if strings.Contains(n, "_"+typename+"_") || strings.HasSuffix(n, "_"+typename) {
-		problems = append(problems, fmt.Errorf(`metric name should not include type '%s'`, typename))
+		problems = append(problems, NewIssuef(RuleMetricTypeInName, SeverityWarning, pathName, `metric name should not include type '%s'`, typename))
 	}
 
 	return problems
@@ -66,7 +64,7 @@ func LintMetricTypeInName(mf *dto.MetricFamily) []error {
 func LintReservedChars(mf *dto.MetricFamily) []error {
 	var problems []error
 	if strings.Contains(mf.GetName(), ":") {
-		problems = append(problems, errors.New("metric names should not contain ':'"))
+		problems = append(problems, NewIssue(RuleReservedChars, SeverityWarning, pathName, "metric names should not contain ':'"))
 	}
 	return problems
 }
@@ -75,13 +73,13 @@ func LintReservedChars(mf *dto.MetricFamily) []error {
 func LintCamelCase(mf *dto.MetricFamily) []error {
 	var problems []error
 	if camelCase.FindString(mf.GetName()) != "" {
-		problems = append(problems, errors.New("metric names should be written in 'snake_case' not 'camelCase'"))
+		problems = append(problems, NewIssue(RuleCamelCase, SeverityWarning, pathName, "metric names should be written in 'snake_case' not 'camelCase'"))
 	}
 
-	for _, m := range mf.GetMetric() {
-		for _, l := range m.GetLabel() {
+	for i, m := range mf.GetMetric() {
+		for j, l := range m.GetLabel() {
 			if camelCase.FindString(l.GetName()) != "" {
-				problems = append(problems, errors.New("label names should be written in 'snake_case' not 'camelCase'"))
+				problems = append(problems, NewIssue(RuleCamelCase, SeverityWarning, LabelPath(i, j)+".name", "label names should be written in 'snake_case' not 'camelCase'"))
 			}
 		}
 	}
@@ -94,7 +92,7 @@ func LintUnitAbbreviations(mf *dto.MetricFamily) []error {
 	n := strings.ToLower(mf.GetName())
 	for _, s := range unitAbbreviations {
 		if strings.Contains(n, "_"+s+"_") || strings.HasSuffix(n, "_"+s) {
-			problems = append(problems, errors.New("metric names should not contain abbreviated units"))
+			problems = append(problems, NewIssue(RuleUnitAbbreviations, SeverityWarning, pathName, "metric names should not contain abbreviated units"))
 		}
 	}
 	return problems

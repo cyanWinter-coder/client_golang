@@ -12,6 +12,11 @@
 // limitations under the License.
 
 // Package promlint provides a linter for Prometheus metrics.
+//
+// Lint reports findings as human-readable Problems and stops at the first
+// malformed metric. Scan reports the same findings as structured Diagnostics
+// that carry a stable rule code, severity, and field path, and it keeps going
+// after malformed input so that every problem is reported in one pass.
 package promlint
 
 import (

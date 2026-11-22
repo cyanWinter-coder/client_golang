@@ -14,7 +14,6 @@
 package validations
 
 import (
-	"errors"
 	"strings"
 
 	dto "github.com/prometheus/client_model/go"
@@ -31,9 +30,9 @@ func LintCounter(mf *dto.MetricFamily) []error {
 
 	switch {
 	case isCounter && !hasTotalSuffix:
-		problems = append(problems, errors.New(`counter metrics should have "_total" suffix`))
+		problems = append(problems, NewIssue(RuleCounter, SeverityWarning, pathName, `counter metrics should have "_total" suffix`))
 	case !isUntyped && !isCounter && hasTotalSuffix:
-		problems = append(problems, errors.New(`non-counter metrics should not have "_total" suffix`))
+		problems = append(problems, NewIssue(RuleCounterReset, SeverityWarning, pathName, `non-counter metrics should not have "_total" suffix`))
 	}
 
 	return problems

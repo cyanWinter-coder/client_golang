@@ -14,8 +14,6 @@
 package validations
 
 import (
-	"errors"
-
 	dto "github.com/prometheus/client_model/go"
 )
 
@@ -25,7 +23,7 @@ func LintHelp(mf *dto.MetricFamily) []error {
 
 	// Expect all metrics to have help text available.
 	if mf.Help == nil {
-		problems = append(problems, errors.New("no help text"))
+		problems = append(problems, NewIssue(RuleHelp, SeverityWarning, pathHelp, "no help text"))
 	}
 
 	return problems
