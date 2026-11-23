@@ -330,8 +330,14 @@ func newNativeHistogramWithClassicBuckets(
 		return nil, err
 	}
 
-	NegativeSpan, NegativeDelta := makeBucketsFromMap(negativeBuckets)
-	PositiveSpan, PositiveDelta := makeBucketsFromMap(positiveBuckets)
+	NegativeSpan, NegativeDelta, err := makeBucketsFromMap(negativeBuckets)
+	if err != nil {
+		return nil, err
+	}
+	PositiveSpan, PositiveDelta, err := makeBucketsFromMap(positiveBuckets)
+	if err != nil {
+		return nil, err
+	}
 	ret := &constNativeHistogram{
 		desc: desc,
 		Histogram: dto.Histogram{

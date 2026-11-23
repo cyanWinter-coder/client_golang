@@ -14,6 +14,8 @@
 package prometheus
 
 import (
+	"bytes"
+	"fmt"
 	"math"
 	"math/rand"
 	"reflect"
@@ -27,6 +29,7 @@ import (
 	"time"
 
 	dto "github.com/prometheus/client_model/go"
+	"github.com/prometheus/common/expfmt"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/timestamppb"
 
@@ -2146,5 +2149,551 @@ func TestHistogramWritePanicCausesWaitForCooldownDeadlock(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("Write timed out spinning in waitForCooldown")
+	}
+}
+
+// validateNativeHistogramSnapshot is the test-side counterpart of the
+// invariants enforced by validateNativeHistogramEncoding. It is deliberately
+// implemented independently (decoding the deltas again from scratch) so that a
+// bug in the production check cannot hide a bad snapshot from the tests.
+func validateNativeHistogramSnapshot(h *dto.Histogram) error {
+	if h.Schema == nil {
+		return nil
+	}
+	if schema := h.GetSchema(); schema < nativeHistogramSchemaMinimum || schema > nativeHistogramSchemaMaximum {
+		return fmt.Errorf("schema %d out of range", schema)
+	}
+	if threshold := h.GetZeroThreshold(); math.IsNaN(threshold) || math.IsInf(threshold, +1) || threshold < 0 {
+		return fmt.Errorf("invalid zero threshold %v", threshold)
+	}
+	var population uint64
+	for _, side := range []struct {
+		name   string
+		spans  []*dto.BucketSpan
+		deltas []int64
+	}{
+		{"positive", h.GetPositiveSpan(), h.GetPositiveDelta()},
+		{"negative", h.GetNegativeSpan(), h.GetNegativeDelta()},
+	} {
+		var spanLength uint64
+		for _, span := range side.spans {
+			spanLength += uint64(span.GetLength())
+		}
+		if spanLength != uint64(len(side.deltas)) {
+			return fmt.Errorf("%s spans cover %d buckets but %d deltas are encoded", side.name, spanLength, len(side.deltas))
+		}
+		var current int64
+		for i, delta := range side.deltas {
+			current += delta
+			if current < 0 {
+				return fmt.Errorf("%s bucket %d has a negative population of %d", side.name, i, current)
+			}
+			population += uint64(current)
+		}
+	}
+	population += h.GetZeroCount()
+	if math.IsNaN(h.GetSampleSum()) {
+		if population > h.GetSampleCount() {
+			return fmt.Errorf("NaN-sum bucket population %d exceeds sample count %d", population, h.GetSampleCount())
+		}
+		return nil
+	}
+	if population != h.GetSampleCount() {
+		return fmt.Errorf("bucket population %d does not equal sample count %d", population, h.GetSampleCount())
+	}
+	return nil
+}
+
+// TestNativeHistogramWriteInvariants repeatedly validates the protobuf emitted
+// by Write while observations, bucket-limit driven schema changes, zero-bucket
+// widening and resets all happen concurrently. Every published snapshot must be
+// a parseable native histogram. The test is deterministic in its values and
+// seeds, so a regression reproduces on every run.
+func TestNativeHistogramWriteInvariants(t *testing.T) {
+	if testing.Short() {
+		t.Skip("Skipping test in short mode.")
+	}
+
+	const (
+		iterations     = 10
+		writesPerIter  = 1000
+		observersCount = 6
+	)
+
+	// Values straddle bucket boundaries and include both signs. The bucket
+	// limiting strategy, and in particular the reset path, is exercised by the
+	// iteration-specific options below.
+	values := make([]float64, 0, 128)
+	for exp := -12; exp <= 12; exp++ {
+		v := math.Ldexp(1, exp)
+		values = append(values, v, math.Nextafter(v, 0), -v, math.Nextafter(-v, 0))
+	}
+	values = append(values, 0, math.MaxFloat64, -math.MaxFloat64)
+
+	for iter := range iterations {
+		t.Run(fmt.Sprintf("iteration_%d", iter), func(t *testing.T) {
+			his := NewHistogram(HistogramOpts{
+				Name:                            "test_native_histogram_invariants",
+				Help:                            "Native histogram invariant test.",
+				NativeHistogramBucketFactor:     1.05,
+				NativeHistogramMaxBucketNumber:  uint32(4 + iter%5),
+				NativeHistogramMaxZeroThreshold: 0.5,
+				NativeHistogramMinResetDuration: time.Duration(iter%2) * time.Millisecond,
+			})
+
+			var wg sync.WaitGroup
+			stop := make(chan struct{})
+			for observer := range observersCount {
+				wg.Add(1)
+				go func(seed int64) {
+					defer wg.Done()
+					r := rand.New(rand.NewSource(seed))
+					for {
+						select {
+						case <-stop:
+							return
+						default:
+							his.Observe(values[r.Intn(len(values))])
+						}
+					}
+				}(int64(observer))
+			}
+
+			for i := range writesPerIter {
+				var out dto.Metric
+				if err := his.Write(&out); err != nil {
+					close(stop)
+					wg.Wait()
+					t.Fatalf("write %d returned an error: %v", i, err)
+				}
+				if err := validateNativeHistogramSnapshot(out.GetHistogram()); err != nil {
+					close(stop)
+					wg.Wait()
+					t.Fatalf("write %d produced an inconsistent histogram: %v\n%v", i, err, out.GetHistogram())
+				}
+			}
+			close(stop)
+			wg.Wait()
+		})
+	}
+}
+
+// TestNativeHistogramWriteInvariantsWithNaN verifies that NaN observations,
+// which increment the sample count without landing in a bucket, still produce a
+// consistent native histogram where the bucket populations never exceed the
+// sample count, even while ±Inf observations keep landing in buckets.
+func TestNativeHistogramWriteInvariantsWithNaN(t *testing.T) {
+	his := NewHistogram(HistogramOpts{
+		Name:                           "test_native_histogram_nan",
+		Help:                           "Native histogram NaN invariant test.",
+		NativeHistogramBucketFactor:    1.1,
+		NativeHistogramMaxBucketNumber: 5,
+	})
+
+	values := []float64{0.5, 1, 2, 4, math.NaN(), math.Inf(1), math.Inf(-1)}
+	for i := range 1000 {
+		his.Observe(values[i%len(values)])
+	}
+
+	var out dto.Metric
+	if err := his.Write(&out); err != nil {
+		t.Fatalf("unexpected write error: %v", err)
+	}
+	if !math.IsNaN(out.GetHistogram().GetSampleSum()) {
+		t.Fatalf("expected a NaN sample sum, got %v", out.GetHistogram().GetSampleSum())
+	}
+	if err := validateNativeHistogramSnapshot(out.GetHistogram()); err != nil {
+		t.Fatalf("inconsistent histogram: %v\n%v", err, out.GetHistogram())
+	}
+}
+
+// TestNewConstNativeHistogramRejectsInvalidInput verifies that the constant
+// native histogram constructor rejects inputs that would otherwise produce a
+// protobuf message that Prometheus cannot parse, or that would silently move a
+// bucket to an index the caller never asked for.
+func TestNewConstNativeHistogramRejectsInvalidInput(t *testing.T) {
+	desc := NewDesc("test_native_histogram", "help", nil, nil)
+	now := time.Now()
+
+	scenarios := []struct {
+		name          string
+		count         uint64
+		sum           float64
+		positive      map[int]int64
+		negative      map[int]int64
+		zeroBucket    uint64
+		schema        int32
+		zeroThreshold float64
+	}{
+		{
+			name:     "negative positive bucket population",
+			count:    3,
+			sum:      3,
+			positive: map[int]int64{0: 5, 1: -2},
+			schema:   2,
+		},
+		{
+			name:     "negative negative bucket population",
+			count:    1,
+			sum:      1,
+			negative: map[int]int64{0: -1},
+			schema:   2,
+		},
+		{
+			name:          "NaN zero threshold",
+			count:         1,
+			sum:           1,
+			positive:      map[int]int64{0: 1},
+			schema:        2,
+			zeroThreshold: math.NaN(),
+		},
+		{
+			name:          "+Inf zero threshold",
+			count:         1,
+			sum:           1,
+			positive:      map[int]int64{0: 1},
+			schema:        2,
+			zeroThreshold: math.Inf(1),
+		},
+		{
+			name:          "negative zero threshold",
+			count:         1,
+			sum:           1,
+			positive:      map[int]int64{0: 1},
+			schema:        2,
+			zeroThreshold: -1,
+		},
+		{
+			name:     "bucket index outside int32 range",
+			count:    1,
+			sum:      1,
+			positive: map[int]int64{1 << 33: 1},
+			schema:   2,
+		},
+		{
+			name:     "bucket gap outside int32 range",
+			count:    2,
+			sum:      2,
+			positive: map[int]int64{math.MinInt32: 1, math.MaxInt32: 1},
+			schema:   2,
+		},
+		{
+			name:       "bucket populations exceed count",
+			count:      1,
+			sum:        1,
+			positive:   map[int]int64{0: 1},
+			zeroBucket: 1,
+			schema:     2,
+		},
+		{
+			name:     "bucket populations below count for finite sum",
+			count:    3,
+			sum:      3,
+			positive: map[int]int64{0: 1},
+			schema:   2,
+		},
+		{
+			name:     "invalid schema",
+			count:    1,
+			sum:      1,
+			positive: map[int]int64{0: 1},
+			schema:   nativeHistogramSchemaMaximum + 1,
+		},
+	}
+
+	for _, s := range scenarios {
+		t.Run(s.name, func(t *testing.T) {
+			_, err := NewConstNativeHistogram(
+				desc, s.count, s.sum, s.positive, s.negative, s.zeroBucket,
+				s.schema, s.zeroThreshold, now,
+			)
+			if err == nil {
+				t.Fatal("expected an error, got nil")
+			}
+		})
+	}
+}
+
+// TestNewConstNativeHistogramAcceptsValidInput guards the valid side of the
+// validation added in TestNewConstNativeHistogramRejectsInvalidInput, so the
+// constructor does not start rejecting legitimate histograms, and checks that
+// every accepted value encodes to a snapshot that passes the invariants.
+func TestNewConstNativeHistogramAcceptsValidInput(t *testing.T) {
+	desc := NewDesc("test_native_histogram", "help", nil, nil)
+	now := time.Now()
+
+	scenarios := []struct {
+		name          string
+		count         uint64
+		sum           float64
+		positive      map[int]int64
+		negative      map[int]int64
+		zeroBucket    uint64
+		schema        int32
+		zeroThreshold float64
+	}{
+		{
+			name:          "empty histogram",
+			schema:        2,
+			zeroThreshold: 0.001,
+		},
+		{
+			name:          "zero threshold of zero",
+			count:         1,
+			sum:           1,
+			positive:      map[int]int64{0: 1},
+			schema:        2,
+			zeroThreshold: 0,
+		},
+		{
+			name:          "extreme but encodable bucket indices",
+			count:         2,
+			sum:           2,
+			positive:      map[int]int64{math.MinInt32: 1, math.MinInt32 + 1: 1},
+			schema:        2,
+			zeroThreshold: 0.001,
+		},
+		{
+			name:          "NaN sum allows bucket populations below the count",
+			count:         3,
+			sum:           math.NaN(),
+			positive:      map[int]int64{0: 1},
+			schema:        2,
+			zeroThreshold: 0.001,
+		},
+		{
+			name:          "negative and positive buckets",
+			count:         4,
+			sum:           2,
+			positive:      map[int]int64{0: 1, 2: 1},
+			negative:      map[int]int64{0: 1, 1: 1},
+			schema:        2,
+			zeroThreshold: 0.001,
+		},
+	}
+
+	for _, s := range scenarios {
+		t.Run(s.name, func(t *testing.T) {
+			m, err := NewConstNativeHistogram(
+				desc, s.count, s.sum, s.positive, s.negative, s.zeroBucket,
+				s.schema, s.zeroThreshold, now,
+			)
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			var out dto.Metric
+			if err := m.Write(&out); err != nil {
+				t.Fatalf("unexpected write error: %v", err)
+			}
+			if err := validateNativeHistogramSnapshot(out.GetHistogram()); err != nil {
+				t.Fatalf("accepted value produced an invalid snapshot: %v\n%v", err, out.GetHistogram())
+			}
+		})
+	}
+}
+
+// TestNewConstHistogramRejectsInvalidBuckets verifies that constant classic
+// histograms reject bucket maps that Prometheus cannot parse.
+func TestNewConstHistogramRejectsInvalidBuckets(t *testing.T) {
+	desc := NewDesc("test_const_histogram", "help", nil, nil)
+	now := time.Now()
+
+	scenarios := []struct {
+		name    string
+		count   uint64
+		buckets map[float64]uint64
+	}{
+		{
+			name:    "NaN upper bound",
+			count:   1,
+			buckets: map[float64]uint64{math.NaN(): 1},
+		},
+		{
+			name:    "decreasing cumulative counts",
+			count:   10,
+			buckets: map[float64]uint64{1: 9, 2: 3},
+		},
+		{
+			name:    "+Inf bound not carrying the sample count",
+			count:   10,
+			buckets: map[float64]uint64{1: 5, math.Inf(1): 7},
+		},
+	}
+
+	for _, s := range scenarios {
+		t.Run(s.name, func(t *testing.T) {
+			if _, err := NewConstHistogram(desc, s.count, 0, s.buckets); err == nil {
+				t.Error("NewConstHistogram: expected an error, got nil")
+			}
+			if _, err := NewConstHistogramWithCreatedTimestamp(desc, s.count, 0, s.buckets, now); err == nil {
+				t.Error("NewConstHistogramWithCreatedTimestamp: expected an error, got nil")
+			}
+		})
+	}
+}
+
+// TestNewHistogramRejectsUnencodableConfig verifies that invalid configuration
+// is rejected at construction time instead of producing a histogram whose
+// encoding every exporter rejects.
+func TestNewHistogramRejectsUnencodableConfig(t *testing.T) {
+	scenarios := []struct {
+		name string
+		opts HistogramOpts
+	}{
+		{
+			name: "NaN bucket factor",
+			opts: HistogramOpts{Name: "a", Help: "h", NativeHistogramBucketFactor: math.NaN()},
+		},
+		{
+			name: "NaN zero threshold",
+			opts: HistogramOpts{Name: "b", Help: "h", NativeHistogramBucketFactor: 1.1, NativeHistogramZeroThreshold: math.NaN()},
+		},
+		{
+			name: "+Inf zero threshold",
+			opts: HistogramOpts{Name: "c", Help: "h", NativeHistogramBucketFactor: 1.1, NativeHistogramZeroThreshold: math.Inf(1)},
+		},
+		{
+			name: "NaN maximum zero threshold",
+			opts: HistogramOpts{Name: "d", Help: "h", NativeHistogramBucketFactor: 1.1, NativeHistogramMaxZeroThreshold: math.NaN()},
+		},
+		{
+			name: "NaN classic bucket",
+			opts: HistogramOpts{Name: "e", Help: "h", Buckets: []float64{1, math.NaN(), 2}},
+		},
+	}
+
+	for _, s := range scenarios {
+		t.Run(s.name, func(t *testing.T) {
+			defer func() {
+				if recover() == nil {
+					t.Error("expected NewHistogram to panic")
+				}
+			}()
+			NewHistogram(s.opts)
+		})
+	}
+}
+
+// TestNewHistogramAcceptsNegativeZeroThreshold guards the documented behavior
+// that any negative NativeHistogramZeroThreshold selects a zero-width zero
+// bucket. The rejection of unencodable configuration must not break it.
+func TestNewHistogramAcceptsNegativeZeroThreshold(t *testing.T) {
+	his := NewHistogram(HistogramOpts{
+		Name:                         "test_negative_zero_threshold",
+		Help:                         "Negative zero threshold selects a zero-width zero bucket.",
+		NativeHistogramBucketFactor:  1.1,
+		NativeHistogramZeroThreshold: NativeHistogramZeroThresholdZero,
+	})
+	his.Observe(1)
+
+	var out dto.Metric
+	if err := his.Write(&out); err != nil {
+		t.Fatalf("unexpected write error: %v", err)
+	}
+	if got := out.GetHistogram().GetZeroThreshold(); got != 0 {
+		t.Errorf("expected a zero-width zero bucket (threshold 0), got %v", got)
+	}
+	if err := validateNativeHistogramSnapshot(out.GetHistogram()); err != nil {
+		t.Fatalf("inconsistent histogram: %v\n%v", err, out.GetHistogram())
+	}
+}
+
+// encodeOpenMetrics2 gathers the provided registry and encodes every metric
+// family with the OpenMetrics 2.0 encoder, which validates exactly the native
+// and classic histogram invariants that Prometheus' own parser enforces: spans
+// matching bucket counts, non-negative bucket populations, an in-range schema,
+// a finite non-negative zero threshold, and monotonically increasing classic
+// buckets. It returns the encoded bytes or the first error.
+func encodeOpenMetrics2(t *testing.T, g Gatherer) []byte {
+	t.Helper()
+	mfs, err := g.Gather()
+	if err != nil {
+		t.Fatalf("gather failed: %v", err)
+	}
+	var buf bytes.Buffer
+	enc := expfmt.NewEncoder(&buf, expfmt.FmtOpenMetrics_2_0_0)
+	for _, mf := range mfs {
+		if err := enc.Encode(mf); err != nil {
+			t.Fatalf("encoding %q failed: %v", mf.GetName(), err)
+		}
+	}
+	if closer, ok := enc.(expfmt.Closer); ok {
+		if err := closer.Close(); err != nil {
+			t.Fatalf("finalizing OpenMetrics 2.0 output failed: %v", err)
+		}
+	}
+	if buf.Len() == 0 {
+		t.Fatal("encoder produced no output")
+	}
+	return buf.Bytes()
+}
+
+// TestHistogramEncodingRoundTrip proves that the protobuf emitted by both the
+// classic and the native histogram paths is accepted by the OpenMetrics 2.0
+// encoder, which applies the same invariants as Prometheus' ingestion parser.
+// It covers the exact edge cases the validation is meant to guarantee: bucket
+// boundaries, NaN and ±Inf observations, both signs, bucket-limit driven schema
+// reductions and zero-bucket widening, plus the constant constructors.
+func TestHistogramEncodingRoundTrip(t *testing.T) {
+	reg := NewPedanticRegistry()
+
+	live := NewHistogram(HistogramOpts{
+		Name:                            "live_native_histogram",
+		Help:                            "Native histogram with observations.",
+		NativeHistogramBucketFactor:     1.05,
+		NativeHistogramMaxBucketNumber:  8,
+		NativeHistogramMaxZeroThreshold: 0.5,
+		NativeHistogramMinResetDuration: time.Millisecond,
+	})
+	for exp := -20; exp <= 20; exp++ {
+		v := math.Ldexp(1, exp)
+		live.Observe(v)
+		live.Observe(math.Nextafter(v, 0))
+		live.Observe(-v)
+	}
+	live.Observe(0)
+	live.Observe(math.NaN())
+	live.Observe(math.Inf(1))
+	live.Observe(math.Inf(-1))
+
+	liveClassic := NewHistogram(HistogramOpts{
+		Name:    "live_classic_histogram",
+		Help:    "Classic histogram with observations.",
+		Buckets: []float64{-1, 0, 1, 10},
+	})
+	for _, v := range []float64{-2, -1, 0, 0.5, 1, 5, 100, math.NaN(), math.Inf(1)} {
+		liveClassic.Observe(v)
+	}
+
+	constNative := MustNewConstNativeHistogram(
+		NewDesc("const_native_histogram", "Constant native histogram.", nil, nil),
+		5, 1.5, map[int]int64{0: 1, 2: 1}, map[int]int64{0: 2}, 1, 2, 0.001, time.Now(),
+	)
+	constClassic := MustNewConstHistogram(
+		NewDesc("const_classic_histogram", "Constant classic histogram.", nil, nil),
+		6, 3.5, map[float64]uint64{-1: 1, 0: 2, 1: 4, 10: 6},
+	)
+
+	// The constant metrics are not Collectors themselves; wrap them so they can
+	// be registered alongside the live histograms.
+	constNativeCollector := CollectorFunc(func(ch chan<- Metric) { ch <- constNative })
+	constClassicCollector := CollectorFunc(func(ch chan<- Metric) { ch <- constClassic })
+
+	for _, c := range []Collector{live, liveClassic, constNativeCollector, constClassicCollector} {
+		if err := reg.Register(c); err != nil {
+			t.Fatalf("registering collector failed: %v", err)
+		}
+	}
+
+	out := encodeOpenMetrics2(t, reg)
+	for _, name := range []string{
+		"live_native_histogram",
+		"live_classic_histogram",
+		"const_native_histogram",
+		"const_classic_histogram",
+	} {
+		if !bytes.Contains(out, []byte(name)) {
+			t.Errorf("encoded output does not contain metric %q:\n%s", name, out)
+		}
 	}
 }

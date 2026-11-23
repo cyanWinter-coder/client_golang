@@ -286,6 +286,18 @@ var errBucketLabelNotAllowed = fmt.Errorf(
 	"%q is not allowed as label name in histograms", bucketLabel,
 )
 
+var (
+	errNativeHistogramBucketFactor = errors.New(
+		"NativeHistogramBucketFactor must not be NaN",
+	)
+	errNativeHistogramZeroThreshold = errors.New(
+		"NativeHistogramZeroThreshold must be finite",
+	)
+	errNativeHistogramMaxZeroThreshold = errors.New(
+		"NativeHistogramMaxZeroThreshold must not be NaN",
+	)
+)
+
 // LinearBuckets creates 'count' regular buckets, each 'width' wide, where the
 // lowest bucket has an upper bound of 'start'. The final +Inf bucket is not
 // counted and not included in the returned slice. The returned slice is meant
@@ -556,6 +568,25 @@ func newHistogram(desc *Desc, opts HistogramOpts, labelValues ...string) Histogr
 		}
 	}
 
+	// Reject configuration that cannot produce a valid encoding: a NaN factor
+	// would otherwise silently select schema 0, and a NaN maximum zero threshold
+	// would silently disable the widening cap because every comparison against
+	// NaN is false. The native-histogram-only checks below run only when native
+	// histograms are enabled.
+	if math.IsNaN(opts.NativeHistogramBucketFactor) {
+		panic(errNativeHistogramBucketFactor)
+	}
+	if opts.NativeHistogramBucketFactor > 1 {
+		// Any negative zero threshold selects a zero-width zero bucket, so it
+		// stays valid; only NaN and +Inf, which cannot be encoded, are rejected.
+		if math.IsNaN(opts.NativeHistogramZeroThreshold) || math.IsInf(opts.NativeHistogramZeroThreshold, +1) {
+			panic(errNativeHistogramZeroThreshold)
+		}
+		if math.IsNaN(opts.NativeHistogramMaxZeroThreshold) {
+			panic(errNativeHistogramMaxZeroThreshold)
+		}
+	}
+
 	if opts.now == nil {
 		opts.now = time.Now
 	}
@@ -590,6 +621,12 @@ func newHistogram(desc *Desc, opts HistogramOpts, labelValues ...string) Histogr
 		h.nativeExemplars = makeNativeExemplars(opts.NativeHistogramExemplarTTL, opts.NativeHistogramMaxExemplars)
 	}
 	for i, upperBound := range h.upperBounds {
+		if math.IsNaN(upperBound) {
+			// A NaN upper bound never compares greater than its neighbour, so
+			// it would slip through the ordering check below and later be
+			// rejected by every encoder. Reject it here instead.
+			panic(fmt.Errorf("histogram bucket bound must not be NaN, got %v at index %d", upperBound, i))
+		}
 		if i < len(h.upperBounds)-1 {
 			if upperBound >= h.upperBounds[i+1] {
 				panic(fmt.Errorf(
@@ -822,8 +859,6 @@ func (h *histogram) Write(out *dto.Metric) error {
 		SampleSum:        new(math.Float64frombits(atomic.LoadUint64(&coldCounts.sumBits))),
 		CreatedTimestamp: timestamppb.New(h.lastResetTime),
 	}
-	out.Histogram = his
-	out.Label = h.labelPairs
 
 	// Allocate the buckets and the values they point to in one go instead
 	// of three times per bucket. A histogram without classic buckets does
@@ -884,8 +919,96 @@ func (h *histogram) Write(out *dto.Metric) error {
 			h.nativeExemplars.Unlock()
 		}
 
+		// A publish must never expose a half-updated snapshot. The counts were
+		// merged under h.mtx, so the invariants below hold for every snapshot
+		// the histogram can produce; verifying them here turns any future
+		// regression into a clear error instead of a scrape that Prometheus
+		// cannot parse. The check is cheap (linear in the number of encoded
+		// buckets) and runs once per Write, not per Observe.
+		if err := validateNativeHistogramEncoding(his); err != nil {
+			return fmt.Errorf("native histogram %s produced an inconsistent snapshot: %w", h.desc.fqName, err)
+		}
+	}
+
+	out.Histogram = his
+	out.Label = h.labelPairs
+	return nil
+}
+
+// validateNativeHistogramEncoding verifies the invariants every encoded native
+// histogram must satisfy for Prometheus to parse it: the schema is in range, the
+// zero threshold is a finite non-negative number, each side's span lengths add
+// up to the number of encoded deltas, no bucket population is negative, and the
+// sum of all bucket populations plus the zero count matches the sample count.
+// For a NaN sample sum, NaN observations increase the count without landing in a
+// bucket, so the bucket population may be smaller but never larger.
+func validateNativeHistogramEncoding(his *dto.Histogram) error {
+	if his.Schema == nil {
+		return nil // A classic-only histogram, nothing native to validate.
+	}
+	if schema := his.GetSchema(); schema < nativeHistogramSchemaMinimum || schema > nativeHistogramSchemaMaximum {
+		return fmt.Errorf("schema %d is outside the allowed range [%d, %d]", schema, nativeHistogramSchemaMinimum, nativeHistogramSchemaMaximum)
+	}
+	if zeroThreshold := his.GetZeroThreshold(); math.IsNaN(zeroThreshold) || math.IsInf(zeroThreshold, +1) || zeroThreshold < 0 {
+		return fmt.Errorf("zero threshold %v must be a finite, non-negative number", zeroThreshold)
+	}
+
+	var population uint64
+	for _, side := range [2]struct {
+		name   string
+		spans  []*dto.BucketSpan
+		deltas []int64
+	}{
+		{"negative", his.GetNegativeSpan(), his.GetNegativeDelta()},
+		{"positive", his.GetPositiveSpan(), his.GetPositiveDelta()},
+	} {
+		sidePopulation, err := validateNativeHistogramSide(side.name, side.spans, side.deltas)
+		if err != nil {
+			return err
+		}
+		if sidePopulation > math.MaxUint64-population {
+			return errors.New("the sum of all bucket populations overflows")
+		}
+		population += sidePopulation
+	}
+
+	if population > math.MaxUint64-his.GetZeroCount() {
+		return errors.New("the sum of all bucket populations overflows")
+	}
+	population += his.GetZeroCount()
+
+	if math.IsNaN(his.GetSampleSum()) {
+		if population > his.GetSampleCount() {
+			return fmt.Errorf("the sum of all bucket populations (%d) exceeds the count of observations (%d)", population, his.GetSampleCount())
+		}
+		return nil
+	}
+	if population != his.GetSampleCount() {
+		return fmt.Errorf("the sum of all bucket populations (%d) does not equal the count of observations (%d)", population, his.GetSampleCount())
 	}
 	return nil
+}
+
+// validateNativeHistogramSide verifies the spans and deltas of one side of a
+// native histogram and returns the total bucket population of that side.
+func validateNativeHistogramSide(name string, spans []*dto.BucketSpan, deltas []int64) (uint64, error) {
+	var spanLength uint64
+	for _, span := range spans {
+		spanLength += uint64(span.GetLength())
+	}
+	if spanLength != uint64(len(deltas)) {
+		return 0, fmt.Errorf("%s spans cover %d buckets but %d deltas are encoded", name, spanLength, len(deltas))
+	}
+	var population uint64
+	var current int64
+	for i, delta := range deltas {
+		current += delta
+		if current < 0 {
+			return 0, fmt.Errorf("%s bucket %d has a negative observation count of %d", name, i, current)
+		}
+		population += uint64(current)
+	}
+	return population, nil
 }
 
 // findBucket returns the index of the bucket for the provided value, or
@@ -1385,6 +1508,47 @@ func (h *constHistogram) Write(out *dto.Metric) error {
 	return nil
 }
 
+// validateConstHistogramBuckets checks that the bucket map of a constant
+// classic histogram can be encoded into a histogram that Prometheus accepts.
+// A NaN upper bound cannot be represented, the cumulative counts must be
+// monotonically non-decreasing in bound order, and if a +Inf bound is given
+// explicitly it must be the highest bound and carry the full sample count like
+// the implicit +Inf bucket would.
+func validateConstHistogramBuckets(count uint64, buckets map[float64]uint64) error {
+	if len(buckets) == 0 {
+		return nil
+	}
+	bounds := make([]float64, 0, len(buckets))
+	for bound := range buckets {
+		if math.IsNaN(bound) {
+			return errors.New("histogram bucket upper bound must not be NaN")
+		}
+		bounds = append(bounds, bound)
+	}
+	sort.Float64s(bounds)
+
+	var prevCount uint64
+	for _, bound := range bounds {
+		cumulative := buckets[bound]
+		if cumulative < prevCount {
+			return fmt.Errorf(
+				"histogram bucket cumulative counts must be non-decreasing: %d (bound %g) < %d",
+				cumulative, bound, prevCount,
+			)
+		}
+		// A +Inf bound sorts last, so it denotes the implicit +Inf bucket and
+		// must carry the full sample count, exactly like the implicit one.
+		if math.IsInf(bound, +1) && cumulative != count {
+			return fmt.Errorf(
+				"the +Inf bucket count %d does not match the sample count %d",
+				cumulative, count,
+			)
+		}
+		prevCount = cumulative
+	}
+	return nil
+}
+
 // NewConstHistogram returns a metric representing a Prometheus histogram with
 // fixed values for the count, sum, and bucket counts. As those parameters
 // cannot be changed, the returned value does not implement the Histogram
@@ -1397,7 +1561,13 @@ func (h *constHistogram) Write(out *dto.Metric) error {
 // bucket. The +Inf bucket is implicit, and its value is equal to the provided count.
 //
 // NewConstHistogram returns an error if the length of labelValues is not
-// consistent with the variable labels in Desc or if Desc is invalid.
+// consistent with the variable labels in Desc, if Desc is invalid, or if the
+// buckets cannot be encoded consistently: a NaN upper bound, cumulative counts
+// that decrease with increasing bounds, or an explicit +Inf bucket that is not
+// the highest bucket or does not carry the sample count.
+//
+// The buckets map is retained, not copied, and is read on every Write. The
+// caller must not mutate it after passing it in.
 func NewConstHistogram(
 	desc *Desc,
 	count uint64,
@@ -1409,6 +1579,9 @@ func NewConstHistogram(
 		return nil, desc.err
 	}
 	if err := validateLabelValues(labelValues, len(desc.variableLabels.names)); err != nil {
+		return nil, err
+	}
+	if err := validateConstHistogramBuckets(count, buckets); err != nil {
 		return nil, err
 	}
 	return &constHistogram{
@@ -1449,6 +1622,9 @@ func NewConstHistogramWithCreatedTimestamp(
 		return nil, desc.err
 	}
 	if err := validateLabelValues(labelValues, len(desc.variableLabels.names)); err != nil {
+		return nil, err
+	}
+	if err := validateConstHistogramBuckets(count, buckets); err != nil {
 		return nil, err
 	}
 	return &constHistogram{
@@ -1907,24 +2083,81 @@ type constNativeHistogram struct {
 	labelPairs []*dto.LabelPair
 }
 
+// validateBucketPopulations checks that every bucket population in the
+// provided map is non-negative and returns the sum of all populations. The sum
+// is accumulated in uint64 with an explicit overflow check so that a set of
+// individually valid bucket populations cannot wrap around and accidentally
+// match the observation count.
+func validateBucketPopulations(buckets map[int]int64) (uint64, error) {
+	var sum uint64
+	for index, population := range buckets {
+		if population < 0 {
+			return 0, fmt.Errorf(
+				"native histogram bucket %d has a negative observation count of %d",
+				index, population,
+			)
+		}
+		add := uint64(population)
+		if add > math.MaxUint64-sum {
+			return 0, errors.New("the sum of all bucket populations overflows")
+		}
+		sum += add
+	}
+	return sum, nil
+}
+
+// validateCount verifies that the bucket populations and the observation count
+// describe a consistent native histogram. Every bucket population must be
+// non-negative, and the sum of all bucket populations plus the zero bucket must
+// equal the observation count. NaN observations increment the count without
+// landing in any bucket, so for a NaN sum the bucket population may be lower
+// than the count, but never higher.
 func validateCount(sum float64, count uint64, negativeBuckets, positiveBuckets map[int]int64, zeroBucket uint64) error {
-	var bucketPopulationSum int64
-	for _, v := range positiveBuckets {
-		bucketPopulationSum += v
+	bucketPopulationSum := zeroBucket
+	for _, buckets := range []map[int]int64{negativeBuckets, positiveBuckets} {
+		population, err := validateBucketPopulations(buckets)
+		if err != nil {
+			return err
+		}
+		if population > math.MaxUint64-bucketPopulationSum {
+			return errors.New("the sum of all bucket populations overflows")
+		}
+		bucketPopulationSum += population
 	}
-	for _, v := range negativeBuckets {
-		bucketPopulationSum += v
+
+	// If the sum of observations is NaN, the number of observations must be
+	// greater or equal to the sum of all bucket counts. Otherwise, the number
+	// of observations must be equal to the sum of all bucket counts.
+	if math.IsNaN(sum) {
+		if bucketPopulationSum > count {
+			return fmt.Errorf(
+				"the sum of all bucket populations (%d) exceeds the count of observations (%d)",
+				bucketPopulationSum, count,
+			)
+		}
+		return nil
 	}
-	bucketPopulationSum += int64(zeroBucket)
-
-	// If the sum of observations is NaN, the number of observations must be greater or equal to the sum of all bucket counts.
-	// Otherwise, the number of observations must be equal to the sum of all bucket counts .
-
-	if math.IsNaN(sum) && bucketPopulationSum > int64(count) ||
-		!math.IsNaN(sum) && bucketPopulationSum != int64(count) {
-		return errors.New("the sum of all bucket populations exceeds the count of observations")
+	if bucketPopulationSum != count {
+		return fmt.Errorf(
+			"the sum of all bucket populations (%d) does not equal the count of observations (%d)",
+			bucketPopulationSum, count,
+		)
 	}
 	return nil
+}
+
+// validateConstNativeHistogram checks the scalar inputs of a constant native
+// histogram that are independent of the bucket encoding. It rejects a zero
+// threshold that cannot be encoded (NaN, +Inf, or negative; negative values are
+// not accepted here even though HistogramOpts treats them as a zero-width zero
+// bucket, because the constant API takes the encoded threshold directly) and
+// inconsistent bucket populations. Bucket indices are checked while encoding in
+// makeBucketsFromMap.
+func validateConstNativeHistogram(sum float64, count uint64, negativeBuckets, positiveBuckets map[int]int64, zeroBucket uint64, zeroThreshold float64) error {
+	if math.IsNaN(zeroThreshold) || math.IsInf(zeroThreshold, +1) || zeroThreshold < 0 {
+		return fmt.Errorf("native histogram zero threshold must be a finite, non-negative number, got %v", zeroThreshold)
+	}
+	return validateCount(sum, count, negativeBuckets, positiveBuckets, zeroBucket)
 }
 
 // NewConstNativeHistogram returns a metric representing a Prometheus native histogram with
@@ -1945,8 +2178,13 @@ func validateCount(sum float64, count uint64, negativeBuckets, positiveBuckets m
 // Schema. Index 0 is for an upper bound of 1 in positive buckets and for a lower bound of -1 in negative buckets.
 // NewConstNativeHistogram returns an error if
 //   - the length of labelValues is not consistent with the variable labels in Desc or if Desc is invalid.
-//   - the schema passed is not between 8 and -4
-//   - the sum of counts in all buckets including the zero bucket does not equal the count if sum is not NaN (or exceeds the count if sum is NaN)
+//   - the schema passed is not between 8 and -4.
+//   - the zero threshold is NaN or +Inf, or negative because the encoded form must be a
+//     finite, non-negative number. A zero threshold of zero is valid and encodes a
+//     zero-width zero bucket.
+//   - a bucket population is negative, so the encoded bucket counts would be negative at some point.
+//   - a bucket index, or the gap between two consecutive bucket indices, does not fit into the int32 span encoding.
+//   - the sum of counts in all buckets including the zero bucket does not equal the count if sum is not NaN (or exceeds the count if sum is NaN).
 //
 // See https://opentelemetry.io/docs/specs/otel/compatibility/prometheus_and_openmetrics/#exponential-histograms for more details about the conversion from OTel to Prometheus.
 func NewConstNativeHistogram(
@@ -1967,14 +2205,20 @@ func NewConstNativeHistogram(
 		return nil, err
 	}
 	if schema > nativeHistogramSchemaMaximum || schema < nativeHistogramSchemaMinimum {
-		return nil, errors.New("invalid native histogram schema")
+		return nil, fmt.Errorf("invalid native histogram schema %d", schema)
 	}
-	if err := validateCount(sum, count, negativeBuckets, positiveBuckets, zeroBucket); err != nil {
+	if err := validateConstNativeHistogram(sum, count, negativeBuckets, positiveBuckets, zeroBucket, zeroThreshold); err != nil {
 		return nil, err
 	}
 
-	NegativeSpan, NegativeDelta := makeBucketsFromMap(negativeBuckets)
-	PositiveSpan, PositiveDelta := makeBucketsFromMap(positiveBuckets)
+	NegativeSpan, NegativeDelta, err := makeBucketsFromMap(negativeBuckets)
+	if err != nil {
+		return nil, err
+	}
+	PositiveSpan, PositiveDelta, err := makeBucketsFromMap(positiveBuckets)
+	if err != nil {
+		return nil, err
+	}
 	ret := &constNativeHistogram{
 		desc: desc,
 		Histogram: dto.Histogram{
@@ -2042,9 +2286,14 @@ func (h *constNativeHistogram) Write(out *dto.Metric) error {
 	return nil
 }
 
-func makeBucketsFromMap(buckets map[int]int64) ([]*dto.BucketSpan, []int64) {
+// makeBucketsFromMap encodes the provided bucket map into the protobuf span and
+// delta representation. It returns an error if a bucket index, or the gap
+// between two consecutive bucket indices, cannot be stored in the int32 span
+// offset. Silently truncating such an index would move the bucket to a
+// different position than the caller supplied.
+func makeBucketsFromMap(buckets map[int]int64) ([]*dto.BucketSpan, []int64, error) {
 	if len(buckets) == 0 {
-		return nil, nil
+		return nil, nil, nil
 	}
 	var ii []int
 	for k := range buckets {
@@ -2072,13 +2321,21 @@ func makeBucketsFromMap(buckets map[int]int64) ([]*dto.BucketSpan, []int64) {
 		// buckets. Needs some research to find the sweet spot. For now,
 		// we assume that gaps of one or two buckets should not create
 		// a new span.
-		iDelta := int32(i - nextI)
+		iDelta := int64(i) - int64(nextI)
+		if iDelta < math.MinInt32 || iDelta > math.MaxInt32 {
+			// The span below stores the gap as an int32. Refuse to encode a
+			// bucket that would be truncated to a wrong index.
+			return nil, nil, fmt.Errorf(
+				"native histogram bucket index %d is too far from the previous bucket index %d to be encoded",
+				i, nextI-1,
+			)
+		}
 		if n == 0 || iDelta > 2 {
 			// We have to create a new span, either because we are
 			// at the very beginning, or because we have found a gap
 			// of more than two buckets.
 			spans = append(spans, &dto.BucketSpan{
-				Offset: new(iDelta),
+				Offset: new(int32(iDelta)),
 				Length: proto.Uint32(0),
 			})
 		} else {
@@ -2091,5 +2348,5 @@ func makeBucketsFromMap(buckets map[int]int64) ([]*dto.BucketSpan, []int64) {
 		appendDelta(count)
 		nextI = i + 1
 	}
-	return spans, deltas
+	return spans, deltas, nil
 }
