@@ -535,6 +535,7 @@ func NewHistogram(opts HistogramOpts) Histogram {
 			UnconstrainedLabels(nil),
 			opts.ConstLabels,
 			WithUnit(opts.Unit),
+			withType(dto.MetricType_HISTOGRAM),
 		),
 		opts,
 	)
@@ -1218,6 +1219,7 @@ func (v2) NewHistogramVec(opts HistogramVecOpts) *HistogramVec {
 		opts.VariableLabels,
 		opts.ConstLabels,
 		WithUnit(opts.Unit),
+		withType(dto.MetricType_HISTOGRAM),
 	)
 	return &HistogramVec{
 		MetricVec: V2.NewMetricVec(MetricVecOpts{

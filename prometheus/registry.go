@@ -74,10 +74,11 @@ func init() {
 // pre-registered.
 func NewRegistry() *Registry {
 	return &Registry{
-		collectorsByID:      map[uint64]Collector{},
-		expiredCleanersByID: map[uint64]ExpiredCleaner{},
-		descIDs:             map[uint64]struct{}{},
-		dimHashesByName:     map[string]uint64{},
+		collectorsByID:          map[uint64]Collector{},
+		expiredCleanersByID:     map[uint64]ExpiredCleaner{},
+		descIDs:                 map[uint64]struct{}{},
+		dimHashesByName:         map[string]uint64{},
+		familyDescriptorsByName: map[string]metricFamilyDescriptor{},
 	}
 }
 
@@ -277,6 +278,48 @@ func (errs MultiError) MaybeUnwrap() error {
 	}
 }
 
+// The metricFamilyDescriptor type contains the registration-time metadata that
+// all Descs with the same fully-qualified metric name must agree on. Label sets
+// are intentionally not part of this identity: a metric family can contain
+// series with different label dimensions, and Gather merges those series.
+type metricFamilyDescriptor struct {
+	help       string
+	unit       string
+	metricType dto.MetricType
+}
+
+// The mergeFamilyDescriptor function checks that two declarations of the same
+// metric family agree on their user-visible metadata. An UNTYPED declaration
+// does not assert a type, so it adopts the other declaration's known type.
+func mergeFamilyDescriptor(existing, incoming metricFamilyDescriptor) (metricFamilyDescriptor, string, string, string) {
+	if existing.help != incoming.help {
+		return metricFamilyDescriptor{}, "help text", existing.help, incoming.help
+	}
+	if existing.unit != incoming.unit {
+		return metricFamilyDescriptor{}, "unit", existing.unit, incoming.unit
+	}
+
+	merged := existing
+	switch {
+	case existing.metricType == incoming.metricType:
+		// Types agree.
+	case existing.metricType == dto.MetricType_UNTYPED:
+		merged.metricType = incoming.metricType
+	case incoming.metricType == dto.MetricType_UNTYPED:
+		// Keep the already known type.
+	default:
+		return metricFamilyDescriptor{}, "type", existing.metricType.String(), incoming.metricType.String()
+	}
+	return merged, "", "", ""
+}
+
+func descriptorConflictError(desc *Desc, conflictScope string, field, existing, incoming string) error {
+	return fmt.Errorf(
+		"%s with the same fully-qualified metric name as %s has a descriptor conflict: %s mismatch: existing %q, new descriptor declares %q",
+		conflictScope, desc, field, existing, incoming,
+	)
+}
+
 // Registry registers Prometheus collectors, collects their metrics, and gathers
 // them into MetricFamilies for exposition. It implements Registerer, Gatherer,
 // and Collector. The zero value is not usable. Create instances with
@@ -287,14 +330,15 @@ func (errs MultiError) MaybeUnwrap() error {
 // Registry implements Collector to allow it to be used for creating groups of
 // metrics. See the Grouping example for how this can be done.
 type Registry struct {
-	mtx                   sync.RWMutex
-	collectorsByID        map[uint64]Collector      // ID is a hash of the descIDs.
-	expiredCleanersByID   map[uint64]ExpiredCleaner // ID is a hash of the descIDs.
-	expiredCleaners       []ExpiredCleaner          // Immutable snapshot of expiredCleanersByID and uncheckedCollectors.
-	descIDs               map[uint64]struct{}
-	dimHashesByName       map[string]uint64
-	uncheckedCollectors   []Collector
-	pedanticChecksEnabled bool
+	mtx                     sync.RWMutex
+	collectorsByID          map[uint64]Collector      // ID is a hash of the descIDs.
+	expiredCleanersByID     map[uint64]ExpiredCleaner // ID is a hash of the descIDs.
+	expiredCleaners         []ExpiredCleaner          // Immutable snapshot of expiredCleanersByID and uncheckedCollectors.
+	descIDs                 map[uint64]struct{}
+	dimHashesByName         map[string]uint64
+	familyDescriptorsByName map[string]metricFamilyDescriptor
+	uncheckedCollectors     []Collector
+	pedanticChecksEnabled   bool
 
 	// lastMetricCount is the number of metrics gathered by the previous
 	// Gather call. It is used to presize the map of metric hashes.
@@ -304,11 +348,12 @@ type Registry struct {
 // Register implements Registerer.
 func (r *Registry) Register(c Collector) error {
 	var (
-		descChan           = make(chan *Desc, capDescChan)
-		newDescIDs         = map[uint64]struct{}{}
-		newDimHashesByName = map[string]uint64{}
-		collectorID        uint64 // All desc IDs XOR'd together.
-		duplicateDescErr   error
+		descChan             = make(chan *Desc, capDescChan)
+		newDescIDs           = map[uint64]struct{}{}
+		newDimHashesByName   = map[string]uint64{}
+		newFamilyDescriptors = map[string]metricFamilyDescriptor{}
+		collectorID          uint64 // All desc IDs XOR'd together.
+		duplicateDescErr     error
 	)
 	go func() {
 		c.Describe(descChan)
@@ -329,9 +374,13 @@ func (r *Registry) Register(c Collector) error {
 		if desc.err != nil {
 			return fmt.Errorf("descriptor %s is invalid: %w", desc, desc.err)
 		}
+		if err := validateDescriptorNames(desc); err != nil {
+			return fmt.Errorf("descriptor %s is invalid: %w", desc, err)
+		}
 
 		// Is the descID unique?
-		// (In other words: Is the fqName + constLabel combination unique?)
+		// (In other words: Is the fqName, label dimension, and constLabel
+		// combination unique?)
 		if _, exists := r.descIDs[desc.id]; exists {
 			duplicateDescErr = fmt.Errorf("descriptor %s already exists with the same fully-qualified name and const label values", desc)
 		}
@@ -343,24 +392,31 @@ func (r *Registry) Register(c Collector) error {
 			collectorID ^= desc.id
 		}
 
-		// Are all the label names and the help string consistent with
-		// previous descriptors of the same name?
-		// First check existing descriptors...
-		if dimHash, exists := r.dimHashesByName[desc.fqName]; exists {
-			if dimHash != desc.dimHash {
-				return fmt.Errorf("a previously registered descriptor with the same fully-qualified name as %s has different label names or a different help string", desc)
+		// Help, unit, and declared type identify the metric family.
+		// Label dimensions may differ and are merged during Gather.
+		newDimHashesByName[desc.fqName] = desc.dimHash
+		family := metricFamilyDescriptor{
+			help:       desc.help,
+			unit:       desc.unit,
+			metricType: desc.metricType,
+		}
+		if existingFamily, exists := r.familyDescriptorsByName[desc.fqName]; exists {
+			var field, existingValue, incomingValue string
+			family, field, existingValue, incomingValue = mergeFamilyDescriptor(existingFamily, family)
+			if field != "" {
+				return descriptorConflictError(desc, "a previously registered descriptor", field, existingValue, incomingValue)
 			}
-			continue
 		}
 
-		// ...then check the new descriptors already seen.
-		if dimHash, exists := newDimHashesByName[desc.fqName]; exists {
-			if dimHash != desc.dimHash {
-				return fmt.Errorf("descriptors reported by collector have inconsistent label names or help strings for the same fully-qualified name, offender is %s", desc)
+		// Then check the new descriptors already seen.
+		if existingFamily, exists := newFamilyDescriptors[desc.fqName]; exists {
+			mergedFamily, field, existingValue, incomingValue := mergeFamilyDescriptor(existingFamily, family)
+			if field != "" {
+				return descriptorConflictError(desc, "descriptors reported by this collector", field, existingValue, incomingValue)
 			}
-			continue
+			family = mergedFamily
 		}
-		newDimHashesByName[desc.fqName] = desc.dimHash
+		newFamilyDescriptors[desc.fqName] = family
 	}
 	// A Collector yielding no Desc at all is considered unchecked.
 	if len(newDescIDs) == 0 {
@@ -396,6 +452,7 @@ func (r *Registry) Register(c Collector) error {
 		r.descIDs[hash] = struct{}{}
 	}
 	maps.Copy(r.dimHashesByName, newDimHashesByName)
+	maps.Copy(r.familyDescriptorsByName, newFamilyDescriptors)
 	if cleaner := unwrapExpiredCleaner(c); cleaner != nil {
 		r.expiredCleanersByID[collectorID] = cleaner
 		r.updateExpiredCleaners()
@@ -439,8 +496,9 @@ func (r *Registry) Unregister(c Collector) bool {
 	for id := range descIDs {
 		delete(r.descIDs, id)
 	}
-	// dimHashesByName is left untouched as those must be consistent
-	// throughout the lifetime of a program.
+	// dimHashesByName and familyDescriptorsByName are left untouched as
+	// help, unit, and type must remain consistent throughout the lifetime
+	// of a program.
 	return true
 }
 
@@ -507,7 +565,7 @@ func (r *Registry) Gather() ([]*dto.MetricFamily, error) {
 	)
 
 	goroutineBudget := len(r.collectorsByID) + len(r.uncheckedCollectors)
-	metricFamiliesByName := make(map[string]*dto.MetricFamily, len(r.dimHashesByName))
+	metricFamiliesByName := make(map[string]*dto.MetricFamily, len(r.familyDescriptorsByName))
 	checkedCollectors := make(chan Collector, len(r.collectorsByID))
 	uncheckedCollectors := make(chan Collector, len(r.uncheckedCollectors))
 	for _, collector := range r.collectorsByID {
@@ -792,7 +850,7 @@ func processMetric(
 	if ok { // Existing name.
 		if metricFamily.GetHelp() != desc.help {
 			return fmt.Errorf(
-				"collected metric %s %s has help %q but should have %q",
+				"collected metric %s %s has help %q but should have %q (help text mismatch)",
 				desc.fqName, dtoMetric, desc.help, metricFamily.GetHelp(),
 			)
 		}
@@ -801,36 +859,36 @@ func processMetric(
 		case dto.MetricType_COUNTER:
 			if dtoMetric.Counter == nil {
 				return fmt.Errorf(
-					"collected metric %s %s should be a Counter",
-					desc.fqName, dtoMetric,
+					"collected metric %s %s should be a Counter; metric type mismatch for family type %s",
+					desc.fqName, dtoMetric, metricFamily.GetType(),
 				)
 			}
 		case dto.MetricType_GAUGE:
 			if dtoMetric.Gauge == nil {
 				return fmt.Errorf(
-					"collected metric %s %s should be a Gauge",
-					desc.fqName, dtoMetric,
+					"collected metric %s %s should be a Gauge; metric type mismatch for family type %s",
+					desc.fqName, dtoMetric, metricFamily.GetType(),
 				)
 			}
 		case dto.MetricType_SUMMARY:
 			if dtoMetric.Summary == nil {
 				return fmt.Errorf(
-					"collected metric %s %s should be a Summary",
-					desc.fqName, dtoMetric,
+					"collected metric %s %s should be a Summary; metric type mismatch for family type %s",
+					desc.fqName, dtoMetric, metricFamily.GetType(),
 				)
 			}
 		case dto.MetricType_UNTYPED:
 			if dtoMetric.Untyped == nil {
 				return fmt.Errorf(
-					"collected metric %s %s should be Untyped",
-					desc.fqName, dtoMetric,
+					"collected metric %s %s should be Untyped; metric type mismatch for family type %s",
+					desc.fqName, dtoMetric, metricFamily.GetType(),
 				)
 			}
 		case dto.MetricType_HISTOGRAM:
 			if dtoMetric.Histogram == nil {
 				return fmt.Errorf(
-					"collected metric %s %s should be a Histogram",
-					desc.fqName, dtoMetric,
+					"collected metric %s %s should be a Histogram; metric type mismatch for family type %s",
+					desc.fqName, dtoMetric, metricFamily.GetType(),
 				)
 			}
 		default:
@@ -1054,7 +1112,7 @@ func checkMetricConsistency(
 		metricFamily.GetType() == dto.MetricType_HISTOGRAM && dtoMetric.Histogram == nil ||
 		metricFamily.GetType() == dto.MetricType_UNTYPED && dtoMetric.Untyped == nil {
 		return fmt.Errorf(
-			"collected metric %q { %s} is not a %s",
+			"collected metric %q { %s} is not a %s (metric type mismatch)",
 			name, dtoMetric, metricFamily.GetType(),
 		)
 	}

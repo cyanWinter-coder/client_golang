@@ -86,6 +86,7 @@ func NewGauge(opts GaugeOpts) Gauge {
 		UnconstrainedLabels(nil),
 		opts.ConstLabels,
 		WithUnit(opts.Unit),
+		withType(dto.MetricType_GAUGE),
 	)
 	result := &gauge{desc: desc, labelPairs: desc.constLabelPairs}
 	result.init(result) // Init self-collection.
@@ -169,6 +170,7 @@ func (v2) NewGaugeVec(opts GaugeVecOpts) *GaugeVec {
 		opts.VariableLabels,
 		opts.ConstLabels,
 		WithUnit(opts.Unit),
+		withType(dto.MetricType_GAUGE),
 	)
 	return &GaugeVec{
 		MetricVec: V2.NewMetricVec(MetricVecOpts{
@@ -324,5 +326,6 @@ func NewGaugeFunc(opts GaugeOpts, function func() float64) GaugeFunc {
 		UnconstrainedLabels(nil),
 		opts.ConstLabels,
 		WithUnit(opts.Unit),
+		withType(dto.MetricType_GAUGE),
 	), GaugeValue, function)
 }

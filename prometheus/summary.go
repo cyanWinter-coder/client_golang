@@ -193,6 +193,7 @@ func NewSummary(opts SummaryOpts) Summary {
 			UnconstrainedLabels(nil),
 			opts.ConstLabels,
 			WithUnit(opts.Unit),
+			withType(dto.MetricType_SUMMARY),
 		),
 		opts,
 	)
@@ -590,6 +591,7 @@ func (v2) NewSummaryVec(opts SummaryVecOpts) *SummaryVec {
 		opts.VariableLabels,
 		opts.ConstLabels,
 		WithUnit(opts.Unit),
+		withType(dto.MetricType_SUMMARY),
 	)
 	return &SummaryVec{
 		MetricVec: V2.NewMetricVec(MetricVecOpts{

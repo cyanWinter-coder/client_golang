@@ -210,3 +210,39 @@ func validateLabelValues(vals []string, expectedNumberOfValues int) error {
 func checkLabelName(l string) bool {
 	return model.UTF8Validation.IsValidLabelName(l) && !strings.HasPrefix(l, reservedLabelPrefix)
 }
+
+// The checkRegisteredMetricName helper applies the conservative Prometheus
+// exposition naming grammar enforced for descriptors registered with a
+// Registry. It is stricter than Desc construction's UTF-8 check because names
+// outside this grammar can be silently escaped or rejected by older scrapers.
+func checkRegisteredMetricName(name string) bool {
+	return model.LegacyValidation.IsValidMetricName(name)
+}
+
+// The checkRegisteredLabelName helper applies the conservative Prometheus
+// label naming grammar enforced for descriptors registered with a Registry.
+func checkRegisteredLabelName(name string) bool {
+	return model.LegacyValidation.IsValidLabelName(name) && !strings.HasPrefix(name, reservedLabelPrefix)
+}
+
+// The validateDescriptorNames function verifies the fully-qualified metric
+// name and every constant and variable label name against the conservative
+// naming grammar expected by Prometheus scrapers.
+func validateDescriptorNames(desc *Desc) error {
+	if !checkRegisteredMetricName(desc.fqName) {
+		return fmt.Errorf("%q is not a valid metric name", desc.fqName)
+	}
+	for _, labelPair := range desc.constLabelPairs {
+		if name := labelPair.GetName(); !checkRegisteredLabelName(name) {
+			return fmt.Errorf("%q is not a valid label name for metric %q", name, desc.fqName)
+		}
+	}
+	if desc.variableLabels != nil {
+		for _, name := range desc.variableLabels.names {
+			if !checkRegisteredLabelName(name) {
+				return fmt.Errorf("%q is not a valid label name for metric %q", name, desc.fqName)
+			}
+		}
+	}
+	return nil
+}

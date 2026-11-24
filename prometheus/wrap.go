@@ -240,6 +240,7 @@ func wrapDesc(desc *Desc, prefix string, labels Labels) *Desc {
 				fqName:          desc.fqName,
 				help:            desc.help,
 				unit:            desc.unit,
+				metricType:      desc.metricType,
 				variableLabels:  desc.variableLabels,
 				constLabelPairs: desc.constLabelPairs,
 				err:             fmt.Errorf("attempted wrapping with already existing label name %q", ln),
@@ -248,5 +249,5 @@ func wrapDesc(desc *Desc, prefix string, labels Labels) *Desc {
 		constLabels[ln] = lv
 	}
 	// NewDesc will do remaining validations.
-	return V2.NewDesc(prefix+desc.fqName, desc.help, desc.variableLabels, constLabels, WithUnit(desc.unit))
+	return V2.NewDesc(prefix+desc.fqName, desc.help, desc.variableLabels, constLabels, WithUnit(desc.unit), withType(desc.metricType))
 }

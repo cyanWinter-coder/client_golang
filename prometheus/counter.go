@@ -96,6 +96,7 @@ func NewCounter(opts CounterOpts) Counter {
 		UnconstrainedLabels(nil),
 		opts.ConstLabels,
 		WithUnit(opts.Unit),
+		withType(dto.MetricType_COUNTER),
 	)
 	if opts.now == nil {
 		opts.now = time.Now
@@ -212,6 +213,7 @@ func (v2) NewCounterVec(opts CounterVecOpts) *CounterVec {
 		opts.VariableLabels,
 		opts.ConstLabels,
 		WithUnit(opts.Unit),
+		withType(dto.MetricType_COUNTER),
 	)
 	if opts.now == nil {
 		opts.now = time.Now
@@ -372,5 +374,6 @@ func NewCounterFunc(opts CounterOpts, function func() float64) CounterFunc {
 		UnconstrainedLabels(nil),
 		opts.ConstLabels,
 		WithUnit(opts.Unit),
+		withType(dto.MetricType_COUNTER),
 	), CounterValue, function)
 }

@@ -33,12 +33,12 @@ import (
 //
 // Descriptors registered with the same registry have to fulfill certain
 // consistency and uniqueness criteria if they share the same fully-qualified
-// name: They must have the same help string and the same label names (aka label
-// dimensions) in each, constLabels and variableLabels, but they must differ in
-// the values of the constLabels.
+// name: They must have the same help string and metric type (and unit, if one
+// is set). Their label dimensions may differ; the registry treats them as the
+// same metric family and Gather merges their series.
 //
-// Descriptors that share the same fully-qualified names and the same label
-// values of their constLabels are considered equal.
+// Descriptors that share the same fully-qualified name, label names, and
+// constant label values are considered equal.
 //
 // Use NewDesc to create new Desc instances.
 type Desc struct {
@@ -48,19 +48,25 @@ type Desc struct {
 	help string
 	// unit provides the unit of this metric.
 	unit string
+	// The declared type of this metric. A Desc created with NewDesc
+	// defaults to dto.MetricType_UNTYPED because its type is often
+	// determined by the metric implementation or sample.
+	metricType dto.MetricType
 	// constLabelPairs contains precalculated DTO label pairs based on
 	// the constant labels.
 	constLabelPairs []*dto.LabelPair
 	// variableLabels contains names of labels and normalization function for
 	// which the metric maintains variable values.
 	variableLabels *compiledLabels
-	// id is a hash of the values of the ConstLabels and fqName. This
-	// must be unique among all registered descriptors and can therefore be
-	// used as an identifier of the descriptor.
+	// id is a hash of the fqName, the declared label dimension, and the
+	// values of the ConstLabels. It must be unique among all registered
+	// descriptors and can therefore be used as an identifier of the
+	// descriptor.
 	id uint64
-	// dimHash is a hash of the label names (preset and variable) and the
-	// Help string. Each Desc with the same fqName must have the same
-	// dimHash.
+	// The dimHash field is retained as the historical hash of the sorted
+	// label names and Help string. Registry family metadata is keyed by
+	// fqName so label dimensions can merge, but keeping the field preserves
+	// the internal descriptor surface.
 	dimHash uint64
 	// err is an error that occurred during construction. It is reported on
 	// registration time.
@@ -74,6 +80,22 @@ type DescOpt func(*Desc)
 func WithUnit(unit string) DescOpt {
 	return func(d *Desc) {
 		d.unit = unit
+	}
+}
+
+// WithType sets the declared metric type for a Desc. Most callers should use a
+// typed constructor such as NewCounter, NewGauge, NewHistogram, or NewSummary,
+// which sets the type automatically. Custom Desc implementations can use this
+// option when their metric type is known at descriptor construction time.
+func WithType(metricType dto.MetricType) DescOpt {
+	return withType(metricType)
+}
+
+// The withType option sets the declared metric type for a Desc. It is the
+// internal implementation shared by typed constructors and WithType.
+func withType(metricType dto.MetricType) DescOpt {
+	return func(d *Desc) {
+		d.metricType = metricType
 	}
 }
 
@@ -105,6 +127,7 @@ func (v2) NewDesc(fqName, help string, variableLabels ConstrainableLabels, const
 		fqName:         fqName,
 		help:           help,
 		variableLabels: variableLabels.compile(),
+		metricType:     dto.MetricType_UNTYPED,
 	}
 
 	for _, opt := range opts {
@@ -156,16 +179,27 @@ func (v2) NewDesc(fqName, help string, variableLabels ConstrainableLabels, const
 		return d
 	}
 
+	// Hash the label dimension without sorting variable label names. Metric
+	// families are identified by fqName alone, but descriptor/collector
+	// identity has to distinguish declarations that provide the same label
+	// names in different orders so those collectors can be registered
+	// separately and merged during Gather. Constant label names are already
+	// sorted, and variable names retain their declared order.
 	xxh := xxhash.New()
 	for _, val := range labelValues {
 		xxh.WriteString(val)
 		xxh.Write(separatorByteSlice)
 	}
+	xxh.WriteString("label-names")
+	xxh.Write(separatorByteSlice)
+	for _, labelName := range labelNames {
+		xxh.WriteString(labelName)
+		xxh.Write(separatorByteSlice)
+	}
 	d.id = xxh.Sum64()
-	// Sort labelNames so that order doesn't matter for the hash.
+
+	// Sort labelNames so the dimension hash is independent of label order.
 	sort.Strings(labelNames)
-	// Now hash together (in this order) the help string, the unit string and the sorted
-	// label names.
 	xxh.Reset()
 	xxh.WriteString(help)
 	xxh.Write(separatorByteSlice)
@@ -185,6 +219,9 @@ func (v2) NewDesc(fqName, help string, variableLabels ConstrainableLabels, const
 		})
 	}
 	sort.Sort(internal.LabelPairSorter(d.constLabelPairs))
+	if d.err == nil {
+		d.err = validateDescriptorNames(d)
+	}
 	return d
 }
 
@@ -194,7 +231,8 @@ func (v2) NewDesc(fqName, help string, variableLabels ConstrainableLabels, const
 // a Collector to signal inability to describe itself.
 func NewInvalidDesc(err error) *Desc {
 	return &Desc{
-		err: err,
+		err:        err,
+		metricType: dto.MetricType_UNTYPED,
 	}
 }
 
@@ -205,6 +243,13 @@ func NewInvalidDesc(err error) *Desc {
 // present, later operations may not behave as expected.
 func (d *Desc) Err() error {
 	return d.err
+}
+
+// Type returns the declared metric type. Descs created with NewDesc and no
+// WithType option return dto.MetricType_UNTYPED. The typed constructors in
+// this package return their corresponding metric type.
+func (d *Desc) Type() dto.MetricType {
+	return d.metricType
 }
 
 func (d *Desc) String() string {
