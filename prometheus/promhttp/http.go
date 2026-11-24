@@ -43,6 +43,7 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/munnerz/goautoneg"
 	dto "github.com/prometheus/client_model/go"
 	"github.com/prometheus/common/expfmt"
 
@@ -288,6 +289,31 @@ func HandlerForTransactional(reg prometheus.TransactionalGatherer, opts HandlerO
 		if !opts.ProcessStartTime.IsZero() {
 			rsp.Header().Set(processStartTimeHeader, strconv.FormatInt(opts.ProcessStartTime.Unix(), 10))
 		}
+
+		// Negotiate the content type and set the Vary headers before gathering
+		// any metrics. Doing this up front guarantees that early error
+		// responses (for example the in-flight limit or a gathering failure)
+		// still carry the Vary headers and a negotiated Content-Type. The
+		// plain-text error helpers reset Content-Type to text/plain to match
+		// the error body, which the negotiated fallback also uses.
+		var (
+			contentType     expfmt.Format
+			acceptedFormats = opts.AcceptedFormats
+		)
+		if len(acceptedFormats) == 0 {
+			acceptedFormats = expfmt.DefaultAcceptedFormats()
+			if opts.EnableOpenMetrics {
+				// OpenMetrics 2.0-rc is included ahead of stable OpenMetrics formats.
+				acceptedFormats = slices.Concat([]expfmt.Format{expfmt.FmtOpenMetrics_2_0_0_rc}, expfmt.DefaultOpenMetricsAcceptedFormats())
+			}
+		}
+		contentType = negotiateContentType(req, acceptedFormats)
+		rsp.Header().Add(varyHeader, acceptHeader)
+		if len(compressions) > 0 {
+			rsp.Header().Add(varyHeader, acceptEncodingHeader)
+		}
+		rsp.Header().Set(contentTypeHeader, string(contentType))
+
 		if inFlightSem != nil {
 			select {
 			case inFlightSem <- struct{}{}: // All good, carry on.
@@ -320,24 +346,6 @@ func HandlerForTransactional(reg prometheus.TransactionalGatherer, opts HandlerO
 				return
 			}
 		}
-
-		var (
-			contentType     expfmt.Format
-			acceptedFormats = opts.AcceptedFormats
-		)
-		if len(acceptedFormats) == 0 {
-			acceptedFormats = expfmt.DefaultAcceptedFormats()
-			if opts.EnableOpenMetrics {
-				// OpenMetrics 2.0-rc is included ahead of stable OpenMetrics formats.
-				acceptedFormats = slices.Concat([]expfmt.Format{expfmt.FmtOpenMetrics_2_0_0_rc}, expfmt.DefaultOpenMetricsAcceptedFormats())
-			}
-		}
-		contentType = expfmt.NegotiateAccept(req.Header, acceptedFormats...)
-		rsp.Header().Add(varyHeader, acceptHeader)
-		if len(compressions) > 0 {
-			rsp.Header().Add(varyHeader, acceptEncodingHeader)
-		}
-		rsp.Header().Set(contentTypeHeader, string(contentType))
 
 		w, encodingHeader, closeWriter, err := negotiateEncodingWriter(req, rsp, compressions)
 		if err != nil {
@@ -669,6 +677,82 @@ func httpError(rsp http.ResponseWriter, err error) {
 		"An error has occurred while serving metrics:\n\n"+err.Error(),
 		http.StatusInternalServerError,
 	)
+}
+
+// negotiateContentType selects the wire format for the response based on the
+// request's Accept header and the server's accepted formats, in preference
+// order. If the client's Accept header cannot be satisfied by any of the
+// accepted formats, the response falls back to the Prometheus text format,
+// even when text is not itself among the accepted formats. This keeps
+// otherwise incompatible scrapers working with a decodable plain-text
+// response instead of an undecodable payload, matching the documented
+// NegotiateAccept fallback contract.
+func negotiateContentType(req *http.Request, acceptedFormats []expfmt.Format) expfmt.Format {
+	if len(acceptedFormats) == 0 || hasTextFormat(acceptedFormats) || acceptHeaderSatisfied(req.Header, acceptedFormats) {
+		// NegotiateAccept handles preference ordering and its own text
+		// fallback whenever a text format is offered or the Accept header
+		// matches one of the offers.
+		return expfmt.NegotiateAccept(req.Header, acceptedFormats...)
+	}
+	// No offered format can satisfy the Accept header: serve plain text so
+	// the scraper still gets a decodable payload.
+	return expfmt.NegotiateAccept(req.Header, expfmt.FmtText)
+}
+
+// hasTextFormat reports whether formats contain a Prometheus text format.
+func hasTextFormat(formats []expfmt.Format) bool {
+	for _, f := range formats {
+		if f.FormatType() == expfmt.TypeTextPlain {
+			return true
+		}
+	}
+	return false
+}
+
+// acceptHeaderSatisfied reports whether any clause of the request's Accept
+// header matches at least one of the offered formats. A missing Accept header
+// is treated as satisfied, as the client expresses no preference.
+func acceptHeaderSatisfied(header http.Header, offers []expfmt.Format) bool {
+	clauses := goautoneg.ParseAccept(header.Get(acceptHeader))
+	if len(clauses) == 0 {
+		return true
+	}
+	for _, clause := range clauses {
+		if clause.Q == 0 {
+			continue
+		}
+		for _, offer := range offers {
+			if acceptClauseMatches(clause, offer) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// acceptClauseMatches reports whether a parsed Accept clause matches format,
+// following the same media type, subtype and version parameter rules as
+// expfmt's internal format matching. Charset and escaping parameters are
+// negotiated separately by expfmt and therefore ignored here.
+func acceptClauseMatches(clause goautoneg.Accept, format expfmt.Format) bool {
+	targets := goautoneg.ParseAccept(string(format))
+	if len(targets) == 0 {
+		return false
+	}
+	target := targets[0]
+	if clause.Type != "*" && clause.Type != target.Type {
+		return false
+	}
+	if clause.SubType != "*" && clause.SubType != target.SubType {
+		return false
+	}
+	version, ok := target.Params["version"]
+	if !ok {
+		return true
+	}
+	// A clause without a version parameter accepts the media type's default
+	// version, which is the only version offered for a given Format.
+	return clause.Params["version"] == "" || clause.Params["version"] == version
 }
 
 // negotiateEncodingWriter reads the Accept-Encoding header from a request and

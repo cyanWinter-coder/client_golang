@@ -23,6 +23,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -317,6 +318,7 @@ func TestHandlerMaxRequestsInFlight(t *testing.T) {
 	w3 := httptest.NewRecorder()
 	request, _ := http.NewRequest(http.MethodGet, "/", nil)
 	request.Header.Add(acceptHeader, acceptTextPlain)
+	request.Header.Add(acceptEncodingHeader, string(Gzip))
 
 	c := blockingCollector{Block: make(chan struct{}), CollectStarted: make(chan struct{}, 1)}
 	reg.MustRegister(c)
@@ -335,6 +337,18 @@ func TestHandlerMaxRequestsInFlight(t *testing.T) {
 	}
 	if got, want := w2.Body.String(), "Limit of concurrent requests reached (1), try again later.\n"; got != want {
 		t.Errorf("got body %q, want %q", got, want)
+	}
+	// The 503 response must still carry the negotiated headers so scrapers
+	// and caches can interpret it consistently with a successful scrape.
+	if got := w2.Header().Get(contentTypeHeader); !strings.HasPrefix(got, "text/plain") {
+		t.Errorf("503 response Content-Type = %q, want a text content type", got)
+	}
+	if got := w2.Header().Get(contentEncodingHeader); got != "" {
+		t.Errorf("503 response must not be compressed, got Content-Encoding %q", got)
+	}
+	if got := strings.Join(w2.Header().Values(varyHeader), ", "); !strings.Contains(got, acceptHeader) ||
+		!strings.Contains(got, acceptEncodingHeader) {
+		t.Errorf("503 response Vary = %q, want it to contain %q and %q", got, acceptHeader, acceptEncodingHeader)
 	}
 
 	close(c.Block)
@@ -1829,5 +1843,231 @@ func TestCoalesceGatherCallersGetDistinctSlices(t *testing.T) {
 	r1.mfs[0] = nil
 	if r2.mfs[0] == nil {
 		t.Error("callers share a slice backing array; each caller must get its own copy")
+	}
+}
+
+// TestNegotiateContentTypeTextFallback verifies that an unsatisfiable Accept
+// header always falls back to the Prometheus text format, even when the
+// handler's AcceptedFormats do not include a text format.
+func TestNegotiateContentTypeTextFallback(t *testing.T) {
+	for _, tc := range []struct {
+		name            string
+		acceptedFormats []expfmt.Format
+		accept          string
+		want            expfmt.Format
+	}{
+		{
+			name:            "unsatisfiable accept with only OpenMetrics offered",
+			acceptedFormats: []expfmt.Format{expfmt.FmtOpenMetrics_1_0_0},
+			accept:          "application/json",
+			want:            expfmt.FmtText,
+		},
+		{
+			name:            "unsatisfiable version with only protobuf offered",
+			acceptedFormats: []expfmt.Format{expfmt.FmtProtoDelim},
+			accept:          "text/html",
+			want:            expfmt.FmtText,
+		},
+		{
+			name:            "matching accept still wins over text fallback",
+			acceptedFormats: []expfmt.Format{expfmt.FmtOpenMetrics_1_0_0},
+			accept:          "application/openmetrics-text;version=1.0.0",
+			want:            expfmt.FmtOpenMetrics_1_0_0,
+		},
+		{
+			name:            "wildcard accept uses server preference",
+			acceptedFormats: []expfmt.Format{expfmt.FmtOpenMetrics_1_0_0},
+			accept:          "*/*",
+			want:            expfmt.FmtOpenMetrics_1_0_0,
+		},
+		{
+			name:            "empty accept uses server preference",
+			acceptedFormats: []expfmt.Format{expfmt.FmtOpenMetrics_1_0_0},
+			accept:          "",
+			want:            expfmt.FmtOpenMetrics_1_0_0,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodGet, "/", nil)
+			if tc.accept != "" {
+				req.Header.Set(acceptHeader, tc.accept)
+			}
+			got := negotiateContentType(req, tc.acceptedFormats)
+			if got.FormatType() != tc.want.FormatType() {
+				t.Errorf("negotiated format type %v, want %v (full format %q)", got.FormatType(), tc.want.FormatType(), got)
+			}
+			if tc.want == expfmt.FmtText && got.FormatType() != expfmt.TypeTextPlain {
+				t.Errorf("got %q, want a text format fallback", got)
+			}
+		})
+	}
+}
+
+// TestHandlerErrorResponseKeepsNegotiationHeaders verifies that a 500 response
+// caused by a gathering failure still carries the Vary and Content-Type
+// headers negotiated from the request, and that the error body is plain text
+// with no Content-Encoding header.
+func TestHandlerErrorResponseKeepsNegotiationHeaders(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	reg.MustRegister(errorCollector{})
+	handler := HandlerFor(reg, HandlerOpts{ErrorHandling: HTTPErrorOnError})
+
+	writer := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	req.Header.Set(acceptHeader, acceptTextPlain)
+	req.Header.Set(acceptEncodingHeader, string(Gzip))
+
+	handler.ServeHTTP(writer, req)
+
+	if got, want := writer.Code, http.StatusInternalServerError; got != want {
+		t.Fatalf("got HTTP status %d, want %d", got, want)
+	}
+	if got := writer.Header().Get(contentTypeHeader); !strings.HasPrefix(got, "text/plain") {
+		t.Errorf("error response Content-Type = %q, want a text content type", got)
+	}
+	if got := writer.Header().Get(contentEncodingHeader); got != "" {
+		t.Errorf("error response must not be compressed, got Content-Encoding %q", got)
+	}
+	if got := strings.Join(writer.Header().Values(varyHeader), ", "); !strings.Contains(got, acceptHeader) ||
+		!strings.Contains(got, acceptEncodingHeader) {
+		t.Errorf("error response Vary = %q, want it to contain %q and %q", got, acceptHeader, acceptEncodingHeader)
+	}
+	if !strings.Contains(writer.Body.String(), "collect error") {
+		t.Errorf("error response body %q must contain the error reason", writer.Body.String())
+	}
+	// The plain-text error body must not look like gzip output to a reader.
+	if _, err := gzip.NewReader(bytes.NewReader(writer.Body.Bytes())); err == nil {
+		t.Error("error body is gzip-compressed despite the missing Content-Encoding")
+	}
+}
+
+// TestHandlerConcurrentScrapersIndependentEncoding reproduces the reported
+// scenario: two scrapers with different scraper versions hit the same
+// coalescing handler concurrently, one requesting gzip and OpenMetrics, the
+// other identity encoding and text format. Both must receive decodable
+// responses whose Content-Encoding matches the body, built from one shared
+// snapshot.
+func TestHandlerConcurrentScrapersIndependentEncoding(t *testing.T) {
+	defer goleak.VerifyNone(t)
+
+	reg := prometheus.NewRegistry()
+	counter := prometheus.NewCounter(prometheus.CounterOpts{
+		Name: "http_requests_total",
+		Help: "Total number of HTTP requests.",
+	})
+	counter.Add(7)
+	reg.MustRegister(counter)
+
+	block := make(chan struct{})
+	started := make(chan struct{}, 1)
+	reg.MustRegister(blockingCollector{CollectStarted: started, Block: block})
+
+	// Build the coalescing gatherer explicitly so the test can wait with
+	// waitForRefs until the second request has joined the in-flight cycle,
+	// mirroring TestCoalesceGatherDoneCalledExactlyOnce.
+	gatherCounter := &syncGatherCounter{g: reg}
+	cg := &coalescingGatherer{g: gatherCounter}
+	handler := HandlerForTransactional(cg, HandlerOpts{
+		EnableOpenMetrics: true,
+	})
+
+	newRequest := func(accept, acceptEncoding string) *http.Request {
+		req := httptest.NewRequest(http.MethodGet, "/", nil)
+		req.Header.Set(acceptHeader, accept)
+		if acceptEncoding != "" {
+			req.Header.Set(acceptEncodingHeader, acceptEncoding)
+		}
+		return req
+	}
+
+	type scrapeResult struct {
+		code            int
+		contentType     string
+		contentEncoding string
+		body            []byte
+	}
+	results := make(chan scrapeResult, 2)
+	serve := func(req *http.Request) {
+		w := httptest.NewRecorder()
+		handler.ServeHTTP(w, req)
+		results <- scrapeResult{
+			code:            w.Code,
+			contentType:     w.Header().Get(contentTypeHeader),
+			contentEncoding: w.Header().Get(contentEncodingHeader),
+			body:            slices.Clone(w.Body.Bytes()),
+		}
+	}
+
+	// Scraper A: gzip + OpenMetrics 1.0. Scraper B: identity + text.
+	reqA := newRequest("application/openmetrics-text;version=1.0.0", string(Gzip))
+	reqB := newRequest(acceptTextPlain, string(Identity))
+
+	go serve(reqA)
+	<-started // The first request is now blocked inside the shared Gather.
+	go serve(reqB)
+	waitForRefs(t, cg, 2) // Both scrapers share the same cycle before release.
+	close(block)
+
+	got := make([]scrapeResult, 0, 2)
+	for range 2 {
+		got = append(got, <-results)
+	}
+
+	if gotCount := gatherCounter.gatherCalled.Load(); gotCount != 1 {
+		t.Fatalf("Gather called %d times, want exactly one shared snapshot", gotCount)
+	}
+
+	for i, res := range got {
+		if res.code != http.StatusOK {
+			t.Errorf("scraper %d: got status %d, want 200", i, res.code)
+		}
+		if res.contentType == "" {
+			t.Errorf("scraper %d: missing Content-Type", i)
+		}
+	}
+
+	// Map results back to the requesting scraper by their negotiated encoding.
+	var gzipped, plain *scrapeResult
+	for i := range got {
+		switch got[i].contentEncoding {
+		case string(Gzip):
+			gzipped = &got[i]
+		case "":
+			plain = &got[i]
+		default:
+			t.Errorf("unexpected Content-Encoding %q", got[i].contentEncoding)
+		}
+	}
+	if gzipped == nil || plain == nil {
+		t.Fatalf("expected one gzip and one identity response, got encodings %q and %q",
+			got[0].contentEncoding, got[1].contentEncoding)
+	}
+
+	if !strings.HasPrefix(gzipped.contentType, "application/openmetrics-text") {
+		t.Errorf("gzip scraper Content-Type = %q, want an OpenMetrics content type", gzipped.contentType)
+	}
+	gzReader, err := gzip.NewReader(bytes.NewReader(gzipped.body))
+	if err != nil {
+		t.Fatalf("gzip scraper body is not valid gzip: %v", err)
+	}
+	gzBody, err := io.ReadAll(gzReader)
+	if err != nil {
+		t.Fatalf("reading gzip body failed: %v", err)
+	}
+	if !strings.Contains(string(gzBody), "http_requests_total 7.0") ||
+		!strings.HasSuffix(string(gzBody), "# EOF\n") {
+		t.Errorf("decoded gzip/OpenMetrics body is missing metric data or the EOF marker:\n%s", gzBody)
+	}
+
+	if !strings.HasPrefix(plain.contentType, "text/plain") {
+		t.Errorf("identity scraper Content-Type = %q, want a text content type", plain.contentType)
+	}
+	if !strings.Contains(string(plain.body), "http_requests_total 7\n") {
+		t.Errorf("plain text body is missing metric data:\n%s", plain.body)
+	}
+	// The identity body must not accidentally be gzip data (the original
+	// "garbled response" symptom).
+	if _, err := gzip.NewReader(bytes.NewReader(plain.body)); err == nil {
+		t.Error("identity scraper received a gzip-compressed body")
 	}
 }
