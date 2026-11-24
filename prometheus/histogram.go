@@ -358,6 +358,39 @@ func ExponentialBucketsRange(minBucket, maxBucket float64, count int) []float64 
 	return buckets
 }
 
+// validateBucketBounds checks that the provided bucket boundaries are finite
+// and sorted in strictly increasing order. A trailing +Inf bound is legal
+// because the +Inf bucket is implicit, so it is removed from the returned
+// slice. Any other non-finite bound (NaN or Inf before the last element) or
+// any violation of the strictly increasing order makes the function panic.
+func validateBucketBounds(bounds []float64) []float64 {
+	for i, upperBound := range bounds {
+		if math.IsNaN(upperBound) {
+			panic(fmt.Errorf(
+				"histogram bucket bound %d is NaN, which is not a valid bound",
+				i,
+			))
+		}
+		if math.IsInf(upperBound, 0) {
+			if i == len(bounds)-1 && upperBound > 0 {
+				// The +Inf bucket is implicit. Remove it here.
+				return bounds[:i]
+			}
+			panic(fmt.Errorf(
+				"histogram bucket bound %d is %f but only a trailing +Inf bound is allowed",
+				i, upperBound,
+			))
+		}
+		if i > 0 && upperBound <= bounds[i-1] {
+			panic(fmt.Errorf(
+				"histogram buckets must be in increasing order: %f >= %f",
+				bounds[i-1], upperBound,
+			))
+		}
+	}
+	return bounds
+}
+
 // HistogramOpts bundles the options for creating a Histogram metric. It is
 // mandatory to set Name to a non-empty string. All other fields are optional
 // and can safely be left at their zero value, although it is strongly
@@ -498,6 +531,15 @@ type HistogramOpts struct {
 	// 5m is used. To always delete the oldest exemplar, set it to a negative value.
 	NativeHistogramExemplarTTL time.Duration
 
+	// ExemplarTTL limits how long an exemplar attached to a classic histogram
+	// bucket is retained. Each bucket keeps at most the most recent exemplar.
+	// At exposition time, an exemplar is dropped if its timestamp is older than
+	// ExemplarTTL. If ExemplarTTL is zero, exemplars are retained until they
+	// are replaced by a newer observation in the same bucket, which preserves
+	// the historical behavior. A negative value disables exemplar retention
+	// entirely, i.e. no exemplars are exposed for classic buckets.
+	ExemplarTTL time.Duration
+
 	// now is for testing purposes, by default it's time.Now.
 	now func() time.Time
 
@@ -570,6 +612,7 @@ func newHistogram(desc *Desc, opts HistogramOpts, labelValues ...string) Histogr
 		nativeHistogramMaxBuckets:       opts.NativeHistogramMaxBucketNumber,
 		nativeHistogramMaxZeroThreshold: opts.NativeHistogramMaxZeroThreshold,
 		nativeHistogramMinResetDuration: opts.NativeHistogramMinResetDuration,
+		exemplarTTL:                     opts.ExemplarTTL,
 		lastResetTime:                   opts.now(),
 		now:                             opts.now,
 		afterFunc:                       opts.afterFunc,
@@ -589,21 +632,9 @@ func newHistogram(desc *Desc, opts HistogramOpts, labelValues ...string) Histogr
 		h.nativeHistogramSchema = pickSchema(opts.NativeHistogramBucketFactor)
 		h.nativeExemplars = makeNativeExemplars(opts.NativeHistogramExemplarTTL, opts.NativeHistogramMaxExemplars)
 	}
-	for i, upperBound := range h.upperBounds {
-		if i < len(h.upperBounds)-1 {
-			if upperBound >= h.upperBounds[i+1] {
-				panic(fmt.Errorf(
-					"histogram buckets must be in increasing order: %f >= %f",
-					upperBound, h.upperBounds[i+1],
-				))
-			}
-		} else {
-			if math.IsInf(upperBound, +1) {
-				// The +Inf bucket is implicit. Remove it here.
-				h.upperBounds = h.upperBounds[:i]
-			}
-		}
-	}
+	// Validate the bucket boundaries before any state is allocated so that an
+	// illegal configuration fails immediately and deterministically.
+	h.upperBounds = validateBucketBounds(h.upperBounds)
 	// Finally we know the final length of h.upperBounds and can make buckets
 	// for both counts as well as exemplars:
 	h.counts[0] = &histogramCounts{buckets: make([]uint64, len(h.upperBounds))}
@@ -747,8 +778,9 @@ type histogram struct {
 	upperBounds                     []float64
 	labelPairs                      []*dto.LabelPair
 	exemplars                       []atomic.Value // One more than buckets (to include +Inf), each a *dto.Exemplar.
-	nativeHistogramSchema           int32          // The initial schema. Set to math.MinInt32 if no sparse buckets are used.
-	nativeHistogramZeroThreshold    float64        // The initial zero threshold.
+	exemplarTTL                     time.Duration
+	nativeHistogramSchema           int32   // The initial schema. Set to math.MinInt32 if no sparse buckets are used.
+	nativeHistogramZeroThreshold    float64 // The initial zero threshold.
 	nativeHistogramMaxZeroThreshold float64
 	nativeHistogramMaxBuckets       uint32
 	nativeHistogramMinResetDuration time.Duration
@@ -846,16 +878,14 @@ func (h *histogram) Write(out *dto.Metric) error {
 		bd.bucket.CumulativeCount = &bd.cumulativeCount
 		bd.bucket.UpperBound = &bd.upperBound
 		his.Bucket[i] = &bd.bucket
-		if e := h.exemplars[i].Load(); e != nil {
-			his.Bucket[i].Exemplar = e.(*dto.Exemplar)
-		}
+		bd.bucket.Exemplar = h.loadExemplar(i)
 	}
 	// If there is an exemplar for the +Inf bucket, we have to add that bucket explicitly.
-	if e := h.exemplars[len(h.upperBounds)].Load(); e != nil {
+	if e := h.loadExemplar(len(h.upperBounds)); e != nil {
 		b := &dto.Bucket{
 			CumulativeCount: new(count),
 			UpperBound:      new(math.Inf(1)),
-			Exemplar:        e.(*dto.Exemplar),
+			Exemplar:        e,
 		}
 		his.Bucket = append(his.Bucket, b)
 	}
@@ -1173,6 +1203,27 @@ func (h *histogram) resetCounts(counts *histogramCounts) {
 	deleteSyncMap(&counts.nativeHistogramBucketsPositive)
 }
 
+// loadExemplar returns the exemplar stored for the provided classic bucket,
+// or nil if no exemplar is retained. With a configured positive ExemplarTTL,
+// exemplars older than the retention window are not exposed. With a negative
+// ExemplarTTL, exemplar retention is disabled entirely. The method does not
+// mutate the stored exemplar, so repeated Write calls leave the internal
+// state untouched.
+func (h *histogram) loadExemplar(bucket int) *dto.Exemplar {
+	if h.exemplarTTL < 0 {
+		return nil
+	}
+	e := h.exemplars[bucket].Load()
+	if e == nil {
+		return nil
+	}
+	exemplar := e.(*dto.Exemplar)
+	if h.exemplarTTL > 0 && h.now().Sub(exemplar.Timestamp.AsTime()) > h.exemplarTTL {
+		return nil
+	}
+	return exemplar
+}
+
 // updateExemplar replaces the exemplar for the provided classic bucket.
 // With empty labels, it's a no-op. It panics if any of the labels is invalid.
 // If histogram is native, the exemplar will be cached into nativeExemplars,
@@ -1185,7 +1236,9 @@ func (h *histogram) updateExemplar(v float64, bucket int, l Labels) {
 	if err != nil {
 		panic(err)
 	}
-	h.exemplars[bucket].Store(e)
+	if h.exemplarTTL >= 0 {
+		h.exemplars[bucket].Store(e)
+	}
 	doSparse := h.nativeHistogramSchema > math.MinInt32 && !math.IsNaN(v)
 	if doSparse {
 		h.nativeExemplars.addExemplar(e)
