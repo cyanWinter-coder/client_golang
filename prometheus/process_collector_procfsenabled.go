@@ -27,40 +27,55 @@ func canCollectProcess() bool {
 func (c *processCollector) processCollect(ch chan<- Metric) {
 	pid, err := c.pidFn()
 	if err != nil {
-		c.reportError(ch, nil, err)
+		c.reportFatalAndLogError(ch, err)
 		return
 	}
 
 	p, err := procfs.NewProc(pid)
 	if err != nil {
-		c.reportError(ch, nil, err)
+		c.reportFatalAndLogError(ch, err)
 		return
 	}
 
+	// Each metric group is collected independently: a failure reading one
+	// source (for example /proc/<pid>/stat) must not prevent the remaining
+	// metrics from being emitted.
 	if stat, err := p.Stat(); err == nil {
-		ch <- MustNewConstMetric(c.cpuTotal, CounterValue, stat.CPUTime())
-		ch <- MustNewConstMetric(c.vsize, GaugeValue, float64(stat.VirtualMemory()))
-		ch <- MustNewConstMetric(c.rss, GaugeValue, float64(stat.ResidentMemory()))
+		// CPUTime converts clock ticks to seconds using the platform's
+		// user HZ value, so the value is already expressed in seconds.
+		c.emitMetric(ch, c.cpuTotal, CounterValue, stat.CPUTime())
+		c.emitMetric(ch, c.vsize, GaugeValue, float64(stat.VirtualMemory()))
+		c.emitMetric(ch, c.rss, GaugeValue, float64(stat.ResidentMemory()))
+
+		// StartTime combines the kernel boot time with the process start
+		// time measured in clock ticks since boot, both converted to
+		// seconds since the Unix epoch.
 		if startTime, err := stat.StartTime(); err == nil {
-			ch <- MustNewConstMetric(c.startTime, GaugeValue, startTime)
+			c.emitMetric(ch, c.startTime, GaugeValue, startTime)
 		} else {
-			c.reportError(ch, c.startTime, err)
+			c.reportAndLogError(ch, c.startTime, err)
 		}
 	} else {
-		c.reportError(ch, nil, err)
+		c.reportAndLogError(ch, c.cpuTotal, err)
+		c.reportAndLogError(ch, c.vsize, err)
+		c.reportAndLogError(ch, c.rss, err)
+		c.reportAndLogError(ch, c.startTime, err)
 	}
 
+	// FileDescriptorsLen counts the entries in /proc/<pid>/fd, which is the
+	// portable source for the number of open file descriptors on Linux.
 	if fds, err := p.FileDescriptorsLen(); err == nil {
-		ch <- MustNewConstMetric(c.openFDs, GaugeValue, float64(fds))
+		c.emitMetric(ch, c.openFDs, GaugeValue, float64(fds))
 	} else {
-		c.reportError(ch, c.openFDs, err)
+		c.reportAndLogError(ch, c.openFDs, err)
 	}
 
 	if limits, err := p.Limits(); err == nil {
-		ch <- MustNewConstMetric(c.maxFDs, GaugeValue, float64(limits.OpenFiles))
-		ch <- MustNewConstMetric(c.maxVsize, GaugeValue, float64(limits.AddressSpace))
+		c.emitMetric(ch, c.maxFDs, GaugeValue, float64(limits.OpenFiles))
+		c.emitMetric(ch, c.maxVsize, GaugeValue, float64(limits.AddressSpace))
 	} else {
-		c.reportError(ch, nil, err)
+		c.reportAndLogError(ch, c.maxFDs, err)
+		c.reportAndLogError(ch, c.maxVsize, err)
 	}
 
 	if netstat, err := p.Netstat(); err == nil {
@@ -71,10 +86,13 @@ func (c *processCollector) processCollect(ch chan<- Metric) {
 		if netstat.OutOctets != nil {
 			outOctets = *netstat.OutOctets
 		}
-		ch <- MustNewConstMetric(c.inBytes, CounterValue, inOctets)
-		ch <- MustNewConstMetric(c.outBytes, CounterValue, outOctets)
+		c.emitMetric(ch, c.inBytes, CounterValue, inOctets)
+		c.emitMetric(ch, c.outBytes, CounterValue, outOctets)
 	} else {
-		c.reportError(ch, nil, err)
+		// Missing network accounting is common inside restricted containers;
+		// skip both network counters without affecting the other metrics.
+		c.reportAndLogError(ch, c.inBytes, err)
+		c.reportAndLogError(ch, c.outBytes, err)
 	}
 }
 

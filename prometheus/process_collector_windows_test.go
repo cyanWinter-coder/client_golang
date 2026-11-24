@@ -118,6 +118,37 @@ func TestWindowsDescribeAndCollectAlignment(t *testing.T) {
 	}
 }
 
+func TestWindowsFiletimeEpochConversion(t *testing.T) {
+	// FILETIME counts 100-nanosecond intervals since 1601-01-01 UTC. The
+	// Unix epoch (1970-01-01 UTC) is therefore exactly
+	// windowsToUnixEpochSeconds * 1e7 ticks after the FILETIME epoch. A
+	// FILETIME instant at the Unix epoch must convert to zero Unix seconds.
+	unixEpochFiletime := windows.Filetime{
+		HighDateTime: uint32((uint64(windowsToUnixEpochSeconds) * 1e7) >> 32),
+		LowDateTime:  uint32((uint64(windowsToUnixEpochSeconds) * 1e7) & 0xffffffff),
+	}
+
+	if got := filetimeToUnixSeconds(unixEpochFiletime); got != 0 {
+		t.Fatalf("FILETIME at the Unix epoch converted to %v seconds, want 0", got)
+	}
+
+	// One second later the conversion must yield exactly one Unix second,
+	// proving the epoch offset and the tick divisor are both applied.
+	oneSecondLater := windows.Filetime{
+		HighDateTime: unixEpochFiletime.HighDateTime,
+		LowDateTime:  unixEpochFiletime.LowDateTime + 1e7,
+	}
+	if got := filetimeToUnixSeconds(oneSecondLater); got != 1 {
+		t.Fatalf("FILETIME one second after the Unix epoch converted to %v, want 1", got)
+	}
+
+	// Intervals used for CPU time must remain independent of the epoch and
+	// convert ticks directly to seconds.
+	if got := fileTimeToSeconds(windows.Filetime{LowDateTime: 1e7}); got != 1 {
+		t.Fatalf("one second of CPU time converted to %v, want 1", got)
+	}
+}
+
 func TestWindowsProcessCollectorUsesPidFn(t *testing.T) {
 	origOpenProcess := openProcess
 	origCloseHandle := closeHandle

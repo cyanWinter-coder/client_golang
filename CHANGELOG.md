@@ -1,6 +1,11 @@
 ## Unreleased
 
 * [CHANGE] Change required go.mod version to 1.26 #2138
+* [FEATURE] prometheus: Add `NewTimedCollector` to bound the duration of a single `Collect` call, returning the metrics collected before the timeout instead of letting a slow collector block the whole scrape.
+* [FEATURE] prometheus: Add `ProcessCollectorOpts.ErrorLogger` so every skipped process metric records its reason independently of `ReportErrors`.
+* [FEATURE] prometheus/collectors: Add `NewFixedGoCollector`, which exports an immutable set of Go runtime metrics with stable names and help texts backed directly by `runtime/metrics`.
+* [BUGFIX] prometheus: Convert Windows process start time from the FILETIME epoch (1601) to the Unix epoch (1970) so `process_start_time_seconds` matches other platforms.
+* [BUGFIX] prometheus: Skip process metrics with NaN, Inf or negative counter values instead of emitting samples that break scrapes, and isolate per-source failures so one unreadable `/proc` file no longer drops unrelated process metrics.
 * [FEATURE] testutil: Add GatherAndFormat to encode a subset of metrics from a Gatherer. #2091
 * [BUGFIX] **breaking** api/prometheus/v1: Fix `TSDBBlocks` so it can decode real server responses; fixes issues with data enveloping and aligns the TSDB Blocks struct types to match the upstream Prometheus counterpart. #1928
 * [BUGFIX] prometheus: `DeletePartialMatch` on a curried vector now deletes only metrics that carry the curried label values. Before, it could also delete matching metrics with other values for the curried labels. #2202

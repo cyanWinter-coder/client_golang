@@ -34,6 +34,12 @@ type ProcessCollectorOpts struct {
 	// metrics are nice to have, but failing to collect them should not
 	// disrupt the collection of the remaining metrics.
 	ReportErrors bool
+	// ErrorLogger, when non-nil, receives the reason of every metric that is
+	// skipped because its data source failed or returned an invalid value
+	// (NaN, Inf or a negative counter). Logging happens independently of
+	// ReportErrors. The zero value disables logging and preserves the
+	// historical behavior of silently skipping failed metrics.
+	ErrorLogger prometheus.ProcessCollectorErrorLogger
 }
 
 // NewProcessCollector returns a collector which exports the current state of
@@ -52,5 +58,6 @@ func NewProcessCollector(opts ProcessCollectorOpts) prometheus.Collector {
 		PidFn:        opts.PidFn,
 		Namespace:    opts.Namespace,
 		ReportErrors: opts.ReportErrors,
+		ErrorLogger:  opts.ErrorLogger,
 	})
 }

@@ -20,6 +20,15 @@ import (
 	"golang.org/x/sys/windows"
 )
 
+// windowsToUnixEpochSeconds is the difference between the Windows FILETIME
+// epoch (1601-01-01 UTC) and the Unix epoch (1970-01-01 UTC), in seconds.
+//
+// 11644473600 seconds = 369 years of leap-year-adjusted days between the two
+// epochs. Subtracting it converts a FILETIME-based timestamp into seconds
+// since the Unix epoch, matching process_start_time_seconds on other
+// platforms.
+const windowsToUnixEpochSeconds = 11644473600
+
 func canCollectProcess() bool {
 	return true
 }
@@ -85,41 +94,53 @@ func getProcessHandleCount(handle windows.Handle) (uint32, error) {
 func (c *processCollector) processCollect(ch chan<- Metric) {
 	pid, err := c.pidFn()
 	if err != nil {
-		c.reportError(ch, nil, err)
+		c.reportFatalAndLogError(ch, err)
 		return
 	}
 
 	h, err := openProcess(windows.PROCESS_QUERY_INFORMATION|windows.PROCESS_VM_READ, false, uint32(pid))
 	if err != nil {
-		c.reportError(ch, nil, err)
+		c.reportFatalAndLogError(ch, err)
 		return
 	}
 	defer closeHandle(h)
 
 	var startTime, exitTime, kernelTime, userTime windows.Filetime
-	err = getProcessTimes(h, &startTime, &exitTime, &kernelTime, &userTime)
-	if err != nil {
-		c.reportError(ch, nil, err)
-		return
+	if err := getProcessTimes(h, &startTime, &exitTime, &kernelTime, &userTime); err != nil {
+		// Skip every time-based metric together: they all come from the same
+		// call, so a partial export would be misleading.
+		c.reportAndLogError(ch, c.startTime, err)
+		c.reportAndLogError(ch, c.cpuTotal, err)
+	} else {
+		// Filetime.Nanoseconds returns nanoseconds since the Windows epoch
+		// (1601-01-01). Convert to seconds since the Unix epoch so the metric
+		// has the same meaning as on Linux and Darwin.
+		c.emitMetric(ch, c.startTime, GaugeValue, filetimeToUnixSeconds(startTime))
+		// FILETIME intervals are independent of the epoch; the 1e7 divisor
+		// converts the 100-nanosecond ticks to seconds.
+		c.emitMetric(ch, c.cpuTotal, CounterValue, fileTimeToSeconds(kernelTime)+fileTimeToSeconds(userTime))
 	}
-	ch <- MustNewConstMetric(c.startTime, GaugeValue, float64(startTime.Nanoseconds()/1e9))
-	ch <- MustNewConstMetric(c.cpuTotal, CounterValue, fileTimeToSeconds(kernelTime)+fileTimeToSeconds(userTime))
 
 	mem, err := getProcessMemoryInfo(h)
 	if err != nil {
-		c.reportError(ch, nil, err)
-		return
+		c.reportAndLogError(ch, c.vsize, err)
+		c.reportAndLogError(ch, c.rss, err)
+	} else {
+		c.emitMetric(ch, c.vsize, GaugeValue, float64(mem.PrivateUsage))
+		c.emitMetric(ch, c.rss, GaugeValue, float64(mem.WorkingSetSize))
 	}
-	ch <- MustNewConstMetric(c.vsize, GaugeValue, float64(mem.PrivateUsage))
-	ch <- MustNewConstMetric(c.rss, GaugeValue, float64(mem.WorkingSetSize))
 
 	handles, err := getProcessHandleCount(h)
 	if err != nil {
-		c.reportError(ch, nil, err)
-		return
+		c.reportAndLogError(ch, c.openFDs, err)
+	} else {
+		// On Windows the equivalent of open file descriptors is the number of
+		// open process handles.
+		c.emitMetric(ch, c.openFDs, GaugeValue, float64(handles))
 	}
-	ch <- MustNewConstMetric(c.openFDs, GaugeValue, float64(handles))
-	ch <- MustNewConstMetric(c.maxFDs, GaugeValue, float64(16*1024*1024)) // Windows has a hard-coded max limit, not per-process.
+	// Windows has a hard-coded system-wide handle limit, not a per-process
+	// rlimit, so the maximum is a constant and never fails to collect.
+	c.emitMetric(ch, c.maxFDs, GaugeValue, float64(16*1024*1024))
 }
 
 // describe returns all descriptions of the collector for windows.
@@ -137,4 +158,12 @@ func (c *processCollector) describe(ch chan<- *Desc) {
 
 func fileTimeToSeconds(ft windows.Filetime) float64 {
 	return float64(uint64(ft.HighDateTime)<<32+uint64(ft.LowDateTime)) / 1e7
+}
+
+// filetimeToUnixSeconds converts a FILETIME instant to seconds since the
+// Unix epoch. FILETIME counts 100-nanosecond intervals since 1601-01-01 UTC,
+// while process_start_time_seconds is documented as seconds since the Unix
+// epoch.
+func filetimeToUnixSeconds(ft windows.Filetime) float64 {
+	return fileTimeToSeconds(ft) - windowsToUnixEpochSeconds
 }

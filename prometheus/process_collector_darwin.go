@@ -75,24 +75,26 @@ func getOpenFileCount() (float64, error) {
 func (c *processCollector) processCollect(ch chan<- Metric) {
 	pid, err := c.pidFn()
 	if err != nil {
-		c.reportError(ch, nil, err)
+		c.reportFatalAndLogError(ch, err)
 		return
 	}
 
 	if procs, err := unix.SysctlKinfoProcSlice("kern.proc.pid", pid); err == nil {
 		if len(procs) == 1 {
+			// P_starttime is a timeval relative to the Unix epoch, so the
+			// nanosecond-to-second conversion yields seconds since 1970.
 			startTime := float64(procs[0].Proc.P_starttime.Nano() / 1e9)
-			ch <- MustNewConstMetric(c.startTime, GaugeValue, startTime)
+			c.emitMetric(ch, c.startTime, GaugeValue, startTime)
 		} else {
 			err = fmt.Errorf("sysctl() returned %d proc structs (expected 1)", len(procs))
-			c.reportError(ch, c.startTime, err)
+			c.reportAndLogError(ch, c.startTime, err)
 		}
 	} else {
-		c.reportError(ch, c.startTime, err)
+		c.reportAndLogError(ch, c.startTime, err)
 	}
 
 	if pid != os.Getpid() {
-		c.reportError(ch, nil, fmt.Errorf("collecting metrics for pid %d is not supported on darwin: process metrics collection is limited to the current process (pid %d)", pid, os.Getpid()))
+		c.reportFatalAndLogError(ch, fmt.Errorf("collecting metrics for pid %d is not supported on darwin: process metrics collection is limited to the current process (pid %d)", pid, os.Getpid()))
 		return
 	}
 
@@ -104,37 +106,43 @@ func (c *processCollector) processCollect(ch chan<- Metric) {
 	rusage := unix.Rusage{}
 
 	if err := unix.Getrusage(syscall.RUSAGE_SELF, &rusage); err == nil {
+		// Both timeval structs count seconds and microseconds since the Unix
+		// epoch; time.Duration.Seconds converts their sum to seconds of CPU
+		// time, which is the unit expected by process_cpu_seconds_total.
 		cpuTime := time.Duration(rusage.Stime.Nano() + rusage.Utime.Nano()).Seconds()
-		ch <- MustNewConstMetric(c.cpuTotal, CounterValue, cpuTime)
+		c.emitMetric(ch, c.cpuTotal, CounterValue, cpuTime)
 	} else {
-		c.reportError(ch, c.cpuTotal, err)
+		c.reportAndLogError(ch, c.cpuTotal, err)
 	}
 
 	if memInfo, err := getMemory(); err == nil {
-		ch <- MustNewConstMetric(c.rss, GaugeValue, float64(memInfo.rss))
-		ch <- MustNewConstMetric(c.vsize, GaugeValue, float64(memInfo.vsize))
+		c.emitMetric(ch, c.rss, GaugeValue, float64(memInfo.rss))
+		c.emitMetric(ch, c.vsize, GaugeValue, float64(memInfo.vsize))
 	} else if !errors.Is(err, errNotImplemented) {
 		// Don't report an error when support is not compiled in.
-		c.reportError(ch, c.rss, err)
-		c.reportError(ch, c.vsize, err)
+		c.reportAndLogError(ch, c.rss, err)
+		c.reportAndLogError(ch, c.vsize, err)
 	}
 
+	// Readdirnames returns one entry per open descriptor including the
+	// /dev/fd directory opened above, so the descriptor count is the number
+	// of entries minus one.
 	if fds, err := getOpenFileCount(); err == nil {
-		ch <- MustNewConstMetric(c.openFDs, GaugeValue, fds)
+		c.emitMetric(ch, c.openFDs, GaugeValue, fds)
 	} else {
-		c.reportError(ch, c.openFDs, err)
+		c.reportAndLogError(ch, c.openFDs, err)
 	}
 
 	if openFiles, err := getSoftLimit(syscall.RLIMIT_NOFILE); err == nil {
-		ch <- MustNewConstMetric(c.maxFDs, GaugeValue, float64(openFiles))
+		c.emitMetric(ch, c.maxFDs, GaugeValue, float64(openFiles))
 	} else {
-		c.reportError(ch, c.maxFDs, err)
+		c.reportAndLogError(ch, c.maxFDs, err)
 	}
 
 	if addressSpace, err := getSoftLimit(syscall.RLIMIT_AS); err == nil {
-		ch <- MustNewConstMetric(c.maxVsize, GaugeValue, float64(addressSpace))
+		c.emitMetric(ch, c.maxVsize, GaugeValue, float64(addressSpace))
 	} else {
-		c.reportError(ch, c.maxVsize, err)
+		c.reportAndLogError(ch, c.maxVsize, err)
 	}
 
 	// TODO: socket(PF_SYSTEM) to fetch "com.apple.network.statistics" might

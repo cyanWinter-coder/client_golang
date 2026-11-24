@@ -22,16 +22,28 @@ import (
 )
 
 type processCollector struct {
-	collectFn         func(chan<- Metric)
-	describeFn        func(chan<- *Desc)
-	pidFn             func() (int, error)
-	reportErrors      bool
+	collectFn    func(chan<- Metric)
+	describeFn   func(chan<- *Desc)
+	pidFn        func() (int, error)
+	reportErrors bool
+	// errorLogger, when non-nil, is used to log the reason for every skipped
+	// metric. It is independent of reportErrors so that skipped metrics remain
+	// observable even when invalid metrics are not emitted into the channel.
+	errorLogger       ProcessCollectorErrorLogger
 	cpuTotal          *Desc
 	openFDs, maxFDs   *Desc
 	vsize, maxVsize   *Desc
 	rss               *Desc
 	startTime         *Desc
 	inBytes, outBytes *Desc
+}
+
+// ProcessCollectorErrorLogger logs collection failures without importing a
+// concrete logging framework. The standard library *log.Logger and popular
+// structured loggers (for example log/slog.Logger via a thin adapter) satisfy
+// this interface.
+type ProcessCollectorErrorLogger interface {
+	Printf(format string, v ...any)
 }
 
 // ProcessCollectorOpts defines the behavior of a process metrics collector
@@ -53,6 +65,14 @@ type ProcessCollectorOpts struct {
 	// metrics are nice to have, but failing to collect them should not
 	// disrupt the collection of the remaining metrics.
 	ReportErrors bool
+	// ErrorLogger, when non-nil, receives the reason of every metric that is
+	// skipped because its data source failed or returned an invalid value
+	// (NaN, Inf or a negative counter). Logging happens independently of
+	// ReportErrors, so failures stay observable even when invalid metrics
+	// are not emitted into the collection channel. The zero value disables
+	// logging and preserves the historical behavior of silently skipping
+	// failed metrics.
+	ErrorLogger ProcessCollectorErrorLogger
 }
 
 // NewProcessCollector is the obsolete version of collectors.NewProcessCollector.
@@ -67,6 +87,7 @@ func NewProcessCollector(opts ProcessCollectorOpts) Collector {
 
 	c := &processCollector{
 		reportErrors: opts.ReportErrors,
+		errorLogger:  opts.ErrorLogger,
 		cpuTotal: NewDesc(
 			ns+"process_cpu_seconds_total",
 			"Total user and system CPU time spent in seconds.",
